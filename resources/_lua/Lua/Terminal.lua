@@ -2,8 +2,10 @@
 -- Shell 终端桥接表盘
 -- 接收快应用的命令请求 → os.execute → 写回结果
 
-local TARGET_DIR = '/data/quickapp/files/com.shell.project/'
+local TARGET_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local CMD_TIMEOUT = 10000  -- 命令超时：10 秒
+
+
 
 local isRunning = false
 local cmdTimer = nil
@@ -13,6 +15,7 @@ local statusBuffer = {}
 local cmdBusy = false
 local cmdStartTime = nil
 local currentCmd = ''
+local currentReq = nil
 
 -- ====== UI ======
 
@@ -143,6 +146,153 @@ local function jsonEncode(val)
     return 'null'
 end
 
+-- ====== JSON 解码器 ======
+
+local function jsonDecode(json)
+    local pos = 1
+    local len = #json
+
+    -- 前向声明互递归的局部函数
+    local parseValue, parseObject, parseArray
+
+    local function skipWS()
+        while pos <= len do
+            local c = json:sub(pos, pos)
+            if c == ' ' or c == '\t' or c == '\n' or c == '\r' then
+                pos = pos + 1
+            else
+                break
+            end
+        end
+    end
+
+    local function parseString()
+        pos = pos + 1
+        local parts = {}
+        while pos <= len do
+            local c = json:sub(pos, pos)
+            if c == '"' then
+                pos = pos + 1
+                return table.concat(parts)
+            elseif c == '\\' then
+                pos = pos + 1
+                if pos > len then error('unterminated escape') end
+                local esc = json:sub(pos, pos)
+                if     esc == '"' then parts[#parts+1] = '"'
+                elseif esc == '\\' then parts[#parts+1] = '\\'
+                elseif esc == '/'  then parts[#parts+1] = '/'
+                elseif esc == 'n'  then parts[#parts+1] = '\n'
+                elseif esc == 'r'  then parts[#parts+1] = '\r'
+                elseif esc == 't'  then parts[#parts+1] = '\t'
+                else error('bad escape: \\' .. esc) end
+                pos = pos + 1
+            else
+                parts[#parts+1] = c
+                pos = pos + 1
+            end
+        end
+        error('unterminated string')
+    end
+
+    local function parseNumber()
+        local start = pos
+        if json:sub(pos, pos) == '-' then pos = pos + 1 end
+        if json:sub(pos, pos) == '0' then
+            pos = pos + 1
+        elseif json:sub(pos, pos) >= '1' and json:sub(pos, pos) <= '9' then
+            repeat pos = pos + 1 until pos > len or json:sub(pos, pos) < '0' or json:sub(pos, pos) > '9'
+        else
+            error('invalid number')
+        end
+        if json:sub(pos, pos) == '.' then
+            pos = pos + 1
+            if pos > len or json:sub(pos, pos) < '0' or json:sub(pos, pos) > '9' then error('invalid fraction') end
+            repeat pos = pos + 1 until pos > len or json:sub(pos, pos) < '0' or json:sub(pos, pos) > '9'
+        end
+        local c = json:sub(pos, pos)
+        if c == 'e' or c == 'E' then
+            pos = pos + 1
+            c = json:sub(pos, pos)
+            if c == '+' or c == '-' then pos = pos + 1 end
+            if pos > len or json:sub(pos, pos) < '0' or json:sub(pos, pos) > '9' then error('invalid exponent') end
+            repeat pos = pos + 1 until pos > len or json:sub(pos, pos) < '0' or json:sub(pos, pos) > '9'
+        end
+        local num = tonumber(json:sub(start, pos - 1))
+        if not num then error('bad number') end
+        return num
+    end
+
+    parseObject = function()
+        pos = pos + 1
+        local obj = {}
+        skipWS()
+        if json:sub(pos, pos) == '}' then pos = pos + 1; return obj end
+        while true do
+            skipWS()
+            if json:sub(pos, pos) ~= '"' then error('expected string key') end
+            local key = parseString()
+            skipWS()
+            if json:sub(pos, pos) ~= ':' then error('expected :') end
+            pos = pos + 1
+            obj[key] = parseValue()
+            skipWS()
+            local c = json:sub(pos, pos)
+            if c == '}' then pos = pos + 1; return obj end
+            if c ~= ',' then error('expected , or }') end
+            pos = pos + 1
+        end
+    end
+
+    parseArray = function()
+        pos = pos + 1
+        local arr = {}
+        skipWS()
+        if json:sub(pos, pos) == ']' then pos = pos + 1; return arr end
+        local idx = 1
+        while true do
+            arr[idx] = parseValue()
+            idx = idx + 1
+            skipWS()
+            local c = json:sub(pos, pos)
+            if c == ']' then pos = pos + 1; return arr end
+            if c ~= ',' then error('expected , or ]') end
+            pos = pos + 1
+        end
+    end
+
+    parseValue = function()
+        skipWS()
+        if pos > len then error('unexpected end') end
+        local c = json:sub(pos, pos)
+        if     c == '"' then return parseString()
+        elseif c == '{' then return parseObject()
+        elseif c == '[' then return parseArray()
+        elseif c == 't' then
+            if json:sub(pos, pos+3) == 'true' then pos = pos + 4; return true end
+            error('bad literal')
+        elseif c == 'f' then
+            if json:sub(pos, pos+4) == 'false' then pos = pos + 5; return false end
+            error('bad literal')
+        elseif c == 'n' then
+            if json:sub(pos, pos+3) == 'null' then pos = pos + 4; return nil end
+            error('bad literal')
+        elseif c == '-' or (c >= '0' and c <= '9') then
+            return parseNumber()
+        else
+            error('unexpected: ' .. c)
+        end
+    end
+
+    local ok, result = pcall(function()
+        skipWS()
+        local val = parseValue()
+        skipWS()
+        return val
+    end)
+    if not ok then return nil end
+    return result
+end
+
 -- ====== 原子写入 ======
 
 local writeSeq = 0
@@ -173,26 +323,40 @@ local function executeShellCommand(cmd)
     local ts = os.date('%H:%M:%S')
     addLog('[' .. ts .. '] Exec: ' .. cmd)
 
-    local logFile = '/tmp/shell_out.txt'
-    os.remove(logFile)
+    local outFile = '/tmp/shell_stdout.txt'
+    os.remove(outFile)
 
-    pcall(os.execute, cmd .. ' > ' .. logFile)
+    local fullCmd = cmd .. ' > ' .. outFile
+    pcall(os.execute, fullCmd)
 
-    local text = ''
-    local f = io.open(logFile, 'r')
-    if f then
+    -- 读取输出
+    local function readAll(path, maxLen)
+        local f = io.open(path, 'r')
+        if not f then return '' end
+        local text = ''
         for line in f:lines() do text = text .. line .. '\n' end
         f:close()
+        if #text > maxLen then text = text:sub(1, maxLen) .. '\n... [truncated at ' .. (maxLen/1024) .. 'KB]' end
+        return text
     end
 
-    if text == '' then text = '(no output)' end
-    if #text > 32768 then text = text:sub(1, 32768) .. '\n... [truncated at 32KB]' end
+    local stdout = readAll(outFile, 32768)
 
-    addLog('[' .. ts .. '] Done (' .. #text .. ' bytes)')
-    return { stdout = text, stderr = '', exitcode = 0 }
+    -- 有输出 = 命令执行成功
+    local exitcode = 0
+    local stderr = ''
+    if stdout == '' then
+        exitcode = -1
+        stdout = '(no output)'
+    end
+
+    addLog('[' .. ts .. '] Done (' .. #stdout .. ' bytes)')
+    return { stdout = stdout, stderr = stderr, exitcode = exitcode }
 end
 
 -- ====== 读取命令请求 ======
+
+local lastParseError = 0
 
 local function readCommandRequest()
     local reqFile = TARGET_DIR .. 'cmd_request.json'
@@ -201,16 +365,27 @@ local function readCommandRequest()
     local content = readFile(reqFile)
     if not content or content == '' then return nil end
 
-    local ok, req = pcall(function()
-        local seq = content:match('"seq"%s*:%s*(%-?%d+)')
-        local cmd = content:match('"cmd"%s*:%s*"([^"]*)"')
-        if seq and cmd then return { seq = tonumber(seq), cmd = cmd } end
+    local json = jsonDecode(content)
+    if not json then
+        -- 可能是文件正在被写入，等 100ms 重试一次
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            -- 连续两次失败才记日志（限频率）
+            local now = os.time()
+            if now - lastParseError >= 5 then
+                addLog('[!] JSON parse error (retried)')
+                lastParseError = now
+            end
+            return nil
+        end
+    end
+    if not json.seq or not json.cmd then
         return nil
-    end)
-
-    if not ok then addLog('[!] parse error'); return nil end
-    if not req then addLog('[!] missing seq/cmd'); return nil end
-    return req
+    end
+    return { seq = json.seq, cmd = json.cmd }
 end
 
 -- ====== 写入命令结果 ======
@@ -233,9 +408,14 @@ local function watchdogCheck()
     local elapsed = (os.clock() or 0) - cmdStartTime
     if elapsed * 1000 < CMD_TIMEOUT then return end
 
-    addLog('[!] Command timed out: ' .. currentCmd)
+    local timedOutCmd = currentCmd
+    local timedOutReq = currentReq
+    addLog('[!] Command timed out: ' .. timedOutCmd)
+
     local res = {
         type = 'cmd_result',
+        seq = timedOutReq and timedOutReq.seq or -1,
+        cmd = timedOutCmd,
         stdout = '',
         stderr = 'Error: Command timed out (' .. CMD_TIMEOUT .. 'ms)',
         exitcode = -1,
@@ -245,6 +425,7 @@ local function watchdogCheck()
     os.remove(TARGET_DIR .. 'cmd_request.json')
     cmdBusy = false
     currentCmd = ''
+    currentReq = nil
     cmdStartTime = nil
 end
 
@@ -259,25 +440,24 @@ local function checkCommandRequest()
 
     cmdBusy = true
     currentCmd = req.cmd
+    currentReq = req
     cmdStartTime = os.clock() or 0
     local result = executeShellCommand(req.cmd)
     writeCommandResult(req, result)
     cmdBusy = false
     currentCmd = ''
+    currentReq = nil
     cmdStartTime = nil
 end
 
 -- ====== 心跳 ======
 
 local function writeHeartbeat()
-    local ts = os.date('%H:%M:%S')
-    local json = '{"type":"system_info","timestamp":"' .. ts .. '"}'
-    local path = TARGET_DIR .. 'system_info.json'
-    os.execute('mkdir -p ' .. TARGET_DIR)
-    local ok, f = pcall(io.open, path, 'w')
-    if not ok or not f then return end
-    f:write(json)
-    f:close()
+    local data = {
+        type = 'system_info',
+        timestamp = tostring(os.time())
+    }
+    atomicWrite('system_info.json', data)
 end
 
 -- ====== 启动/停止 ======
@@ -328,4 +508,4 @@ clearBtn:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
 
 -- ====== 初始状态 ======
 
-terminal:set { text = "=== Terminal Bridge ===\nStatus: STOPPED\n\nPress START\n\nDir: /data/quickapp/files/com.shell.project/" }
+terminal:set { text = "=== Terminal Bridge ===\nStatus: STOPPED\n\nPress START\n\nDir: /data/quickapp/files/com.shell.liangyi/" }
