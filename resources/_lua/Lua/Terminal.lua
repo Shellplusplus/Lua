@@ -4,6 +4,14 @@
 
 local TARGET_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local CMD_TIMEOUT = 10000  -- 命令超时：10 秒
+local SCREEN_W = lvgl.HOR_RES()
+local SCREEN_H = lvgl.VER_RES()
+local FB_PATH = '/dev/fb0'
+local SCREENSHOT_DIR = TARGET_DIR .. 'screenshots/'
+local SCREENSHOT_REQ_TIMEOUT = 30
+local SCREENSHOT_HISTORY_LIMIT = 20
+local TMP_RAW = '/tmp/shell_screenshot.raw'
+local STRIDE_BYTES = SCREEN_W * 3
 
 
 
@@ -16,6 +24,11 @@ local cmdBusy = false
 local cmdStartTime = nil
 local currentCmd = ''
 local currentReq = nil
+local busyMode = ''
+local screenshotPending = false
+local screenshotReq = nil
+local screenshotWaitStartedAt = 0
+local screenshotPhase = ''
 
 -- ====== UI ======
 
@@ -100,12 +113,35 @@ local function fileExists(path)
     return false
 end
 
+local function removeFile(path)
+    pcall(os.remove, path)
+end
+
+local function mkdir(path)
+    os.execute('mkdir -p "' .. path .. '"')
+end
+
+local function readAll(path, maxLen)
+    local f = io.open(path, 'r')
+    if not f then return '' end
+    local text = ''
+    for line in f:lines() do
+        text = text .. line .. '\n'
+    end
+    f:close()
+    if maxLen and #text > maxLen then
+        text = text:sub(1, maxLen) .. '\n... [truncated at ' .. (maxLen / 1024) .. 'KB]'
+    end
+    return text
+end
+
 local function addLog(line)
     table.insert(statusBuffer, 1, line)
     while #statusBuffer > 25 do table.remove(statusBuffer) end
     local t = "=== Terminal Bridge ===\n"
     t = t .. "Status: " .. (isRunning and "RUNNING" or "STOPPED") .. "\n"
     t = t .. "Busy: " .. tostring(cmdBusy) .. "\n"
+    t = t .. "Mode: " .. (busyMode ~= '' and busyMode or '-') .. "\n"
     t = t .. string.rep("-", 28) .. "\n"
     for i = 1, #statusBuffer do
         t = t .. statusBuffer[i] .. "\n"
@@ -313,6 +349,28 @@ local function atomicWrite(filename, data)
     return true
 end
 
+local function atomicWriteJson(filename, data)
+    local json = jsonEncode(data)
+    local tmp = TARGET_DIR .. '.' .. filename .. '.tmp'
+    local path = TARGET_DIR .. filename
+    os.execute('mkdir -p ' .. TARGET_DIR)
+    local ok = writeFile(tmp, json)
+    if not ok then return false end
+    os.remove(path)
+    os.execute('mv "' .. tmp .. '" "' .. path .. '"')
+    return true
+end
+
+local function writeBridgeState(busy, mode, message)
+    atomicWrite('bridge_state.json', {
+        type = 'bridge_state',
+        busy = busy == true,
+        mode = mode or '',
+        message = message or '',
+        timestamp = tostring(os.time())
+    })
+end
+
 -- ====== 命令执行 ======
 
 local function executeShellCommand(cmd)
@@ -329,17 +387,6 @@ local function executeShellCommand(cmd)
     local fullCmd = cmd .. ' > ' .. outFile
     pcall(os.execute, fullCmd)
 
-    -- 读取输出
-    local function readAll(path, maxLen)
-        local f = io.open(path, 'r')
-        if not f then return '' end
-        local text = ''
-        for line in f:lines() do text = text .. line .. '\n' end
-        f:close()
-        if #text > maxLen then text = text:sub(1, maxLen) .. '\n... [truncated at ' .. (maxLen/1024) .. 'KB]' end
-        return text
-    end
-
     local stdout = readAll(outFile, 32768)
 
     -- 有输出 = 命令执行成功
@@ -352,6 +399,205 @@ local function executeShellCommand(cmd)
 
     addLog('[' .. ts .. '] Done (' .. #stdout .. ' bytes)')
     return { stdout = stdout, stderr = stderr, exitcode = exitcode }
+end
+
+local function writeScreenshotResult(data)
+    atomicWrite('screenshot_result.json', data)
+end
+
+local function readScreenshotHistory()
+    local content = readFile(TARGET_DIR .. 'screenshot_history.json')
+    if not content or content == '' then return {} end
+    local json = jsonDecode(content)
+    if type(json) ~= 'table' then return {} end
+    if json.items and type(json.items) == 'table' then
+        return json.items
+    end
+    return json
+end
+
+local function writeScreenshotHistory(items)
+    return atomicWriteJson('screenshot_history.json', items)
+end
+
+local function nextScreenshotIndex()
+    local items = readScreenshotHistory()
+    local maxIndex = 0
+    for i = 1, #items do
+        local idx = tonumber(items[i] and items[i].index) or 0
+        if idx > maxIndex then
+            maxIndex = idx
+        end
+    end
+    return maxIndex + 1, items
+end
+
+local function appendScreenshotHistory(item)
+    local _, items = nextScreenshotIndex()
+    table.insert(items, 1, item)
+    while #items > SCREENSHOT_HISTORY_LIMIT do
+        table.remove(items)
+    end
+    writeScreenshotHistory(items)
+end
+
+local function writePng(path, width, height, rgb888Data)
+    local fPng = io.open(path, 'wb')
+    if not fPng then
+        return false
+    end
+
+    local crcTable = {}
+    for i = 0, 255 do
+        local c = i
+        for _ = 1, 8 do
+            if c % 2 == 1 then
+                c = math.floor(c / 2) ~ 0xEDB88320
+            else
+                c = math.floor(c / 2)
+            end
+        end
+        crcTable[i] = c
+    end
+
+    local function writeInt32(n)
+        fPng:write(string.char(
+            (n >> 24) & 0xFF,
+            (n >> 16) & 0xFF,
+            (n >> 8) & 0xFF,
+            n & 0xFF
+        ))
+    end
+
+    local function calculateCRC(data)
+        local crc = 0xFFFFFFFF
+        for i = 1, #data do
+            crc = (crc >> 8) ~ crcTable[(crc ~ string.byte(data, i)) & 0xFF]
+        end
+        return crc ~ 0xFFFFFFFF
+    end
+
+    local function calculateAdler32(data)
+        local a, b = 1, 0
+        for i = 1, #data do
+            a = (a + string.byte(data, i)) % 65521
+            b = (b + a) % 65521
+        end
+        return (b << 16) | a
+    end
+
+    local function writeChunk(typeName, data)
+        local full = typeName .. data
+        writeInt32(#data)
+        fPng:write(full)
+        writeInt32(calculateCRC(full))
+    end
+
+    fPng:write('\137PNG\r\n\026\n')
+    writeChunk('IHDR', string.char(
+        (width >> 24) & 0xFF, (width >> 16) & 0xFF, (width >> 8) & 0xFF, width & 0xFF,
+        (height >> 24) & 0xFF, (height >> 16) & 0xFF, (height >> 8) & 0xFF, height & 0xFF,
+        8, 2, 0, 0, 0
+    ))
+
+    local scanlines = {}
+    local rowLen = width * 3
+    for y = 0, height - 1 do
+        local rowStart = y * rowLen + 1
+        scanlines[#scanlines + 1] = '\0' .. rgb888Data:sub(rowStart, rowStart + rowLen - 1)
+    end
+
+    local imgData = table.concat(scanlines)
+    local zlib = { '\x78\x01' }
+    local pos = 1
+    local len = #imgData
+    while pos <= len do
+        local chunk = math.min(65535, len - pos + 1)
+        local final = (pos + chunk > len) and 1 or 0
+        local l = chunk & 0xFF
+        local h = (chunk >> 8) & 0xFF
+        zlib[#zlib + 1] = string.char(final, l, h, 255 - l, 255 - h)
+        zlib[#zlib + 1] = imgData:sub(pos, pos + chunk - 1)
+        pos = pos + chunk
+    end
+
+    local adler = calculateAdler32(imgData)
+    zlib[#zlib + 1] = string.char(
+        (adler >> 24) & 0xFF,
+        (adler >> 16) & 0xFF,
+        (adler >> 8) & 0xFF,
+        adler & 0xFF
+    )
+
+    writeChunk('IDAT', table.concat(zlib))
+    writeChunk('IEND', '')
+    fPng:close()
+    return true
+end
+
+local function extractRgb888(rawData)
+    local rows = {}
+    for y = 0, SCREEN_H - 1 do
+        local rowParts = {}
+        local lineStart = y * STRIDE_BYTES + 1
+        for x = 0, SCREEN_W - 1 do
+            local p = lineStart + x * 3
+            local b = string.byte(rawData, p) or 0
+            local g = string.byte(rawData, p + 1) or 0
+            local r = string.byte(rawData, p + 2) or 0
+            rowParts[#rowParts + 1] = string.char(r, g, b)
+        end
+        rows[#rows + 1] = table.concat(rowParts)
+    end
+    return table.concat(rows)
+end
+
+local function captureScreenshot(req)
+    mkdir(SCREENSHOT_DIR)
+    removeFile(TMP_RAW)
+    os.execute('dd if=' .. FB_PATH .. ' of=' .. TMP_RAW .. ' bs=' .. tostring(STRIDE_BYTES) .. ' skip=' .. tostring(SCREEN_H) .. ' count=' .. tostring(SCREEN_H) .. ' 2>/dev/null')
+
+    local fRaw = io.open(TMP_RAW, 'rb')
+    if not fRaw then
+        return nil, '无法读取截图临时文件'
+    end
+
+    local rawData = fRaw:read('*a') or ''
+    fRaw:close()
+    local needBytes = STRIDE_BYTES * SCREEN_H
+    if #rawData < needBytes then
+        removeFile(TMP_RAW)
+        return nil, '截图数据不足'
+    end
+
+    local rgbData = extractRgb888(rawData)
+    rawData = nil
+    pcall(collectgarbage, 'collect')
+
+    local index = nextScreenshotIndex()
+    local capturedAt = os.date('%Y-%m-%d %H:%M:%S')
+    local filename = string.format('shot_%03d_%s.png', index, os.date('%Y%m%d_%H%M%S'))
+    local outPath = SCREENSHOT_DIR .. filename
+    local quickPath = 'internal://files/screenshots/' .. filename
+    local ok = writePng(outPath, SCREEN_W, SCREEN_H, rgbData)
+    rgbData = nil
+    removeFile(TMP_RAW)
+    pcall(collectgarbage, 'collect')
+    os.execute('sync')
+
+    if not ok then
+        return nil, 'PNG 写入失败'
+    end
+
+    local item = {
+        seq = req.seq,
+        index = index,
+        file = quickPath,
+        name = filename,
+        capturedAt = capturedAt
+    }
+    appendScreenshotHistory(item)
+    return item
 end
 
 -- ====== 读取命令请求 ======
@@ -385,7 +631,30 @@ local function readCommandRequest()
     if not json.seq or not json.cmd then
         return nil
     end
-    return { seq = json.seq, cmd = json.cmd }
+    return { seq = json.seq, cmd = json.cmd, type = json.type or 'cmd' }
+end
+
+local function readScreenshotRequest()
+    local reqFile = TARGET_DIR .. 'screenshot_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            return nil
+        end
+    end
+    if not json.seq then
+        return nil
+    end
+    return { seq = json.seq, type = 'screenshot' }
 end
 
 -- ====== 写入命令结果 ======
@@ -400,10 +669,75 @@ local function writeCommandResult(req, result)
     os.remove(TARGET_DIR .. 'cmd_request.json')
 end
 
+local function finishScreenshotError(message)
+    local req = screenshotReq or { seq = -1 }
+    writeScreenshotResult({
+        type = 'screenshot_result',
+        seq = req.seq,
+        status = 'error',
+        message = message,
+        timestamp = os.date('%H:%M:%S')
+    })
+    writeBridgeState(false, '', '')
+    screenshotPending = false
+    screenshotReq = nil
+    screenshotWaitStartedAt = 0
+    screenshotPhase = ''
+    cmdBusy = false
+    busyMode = ''
+end
+
+local function finishScreenshotSuccess(item)
+    writeScreenshotResult({
+        type = 'screenshot_result',
+        seq = item.seq,
+        status = 'done',
+        message = '截图完成',
+        index = item.index,
+        file = item.file,
+        name = item.name,
+        capturedAt = item.capturedAt,
+        timestamp = os.date('%H:%M:%S')
+    })
+    writeBridgeState(false, '', '')
+    screenshotPending = false
+    screenshotReq = nil
+    screenshotWaitStartedAt = 0
+    screenshotPhase = ''
+    cmdBusy = false
+    busyMode = ''
+end
+
+local function prepareScreenshotRequest(req)
+    screenshotPending = true
+    screenshotReq = req
+    screenshotWaitStartedAt = os.time()
+    screenshotPhase = 'waiting_screen_on'
+    cmdBusy = true
+    busyMode = 'screenshot'
+    writeBridgeState(true, 'screenshot', '请熄屏后重新亮屏')
+    writeScreenshotResult({
+        type = 'screenshot_result',
+        seq = req.seq,
+        status = 'waiting_screen_on',
+        message = '请熄屏后重新亮屏',
+        timestamp = os.date('%H:%M:%S')
+    })
+    os.remove(TARGET_DIR .. 'screenshot_request.json')
+    addLog('[shot] waiting for screen on')
+end
+
 -- ====== 看门狗：检测命令超时 ======
 
 local function watchdogCheck()
     if not cmdBusy then return end
+    if busyMode == 'screenshot' then
+        if screenshotPending and screenshotWaitStartedAt > 0 and (os.time() - screenshotWaitStartedAt) >= SCREENSHOT_REQ_TIMEOUT then
+            addLog('[shot] timeout')
+            finishScreenshotError('截图超时，请重试')
+        end
+        return
+    end
     if not cmdStartTime then return end
     local elapsed = (os.clock() or 0) - cmdStartTime
     if elapsed * 1000 < CMD_TIMEOUT then return end
@@ -424,12 +758,23 @@ local function watchdogCheck()
     atomicWrite('cmd_result.json', res)
     os.remove(TARGET_DIR .. 'cmd_request.json')
     cmdBusy = false
+    busyMode = ''
+    writeBridgeState(false, '', '')
     currentCmd = ''
     currentReq = nil
     cmdStartTime = nil
 end
 
 -- ====== 定时器回调 ======
+
+local function checkScreenshotRequest()
+    if cmdBusy then return end
+    if not isRunning then return end
+
+    local req = readScreenshotRequest()
+    if not req then return end
+    prepareScreenshotRequest(req)
+end
 
 local function checkCommandRequest()
     if cmdBusy then return end
@@ -439,12 +784,16 @@ local function checkCommandRequest()
     if not req then return end
 
     cmdBusy = true
+    busyMode = 'cmd'
     currentCmd = req.cmd
     currentReq = req
     cmdStartTime = os.clock() or 0
+    writeBridgeState(true, 'cmd', '命令执行中')
     local result = executeShellCommand(req.cmd)
     writeCommandResult(req, result)
     cmdBusy = false
+    busyMode = ''
+    writeBridgeState(false, '', '')
     currentCmd = ''
     currentReq = nil
     cmdStartTime = nil
@@ -464,12 +813,19 @@ end
 
 local function startService()
     if isRunning then return end
-    isRunning = true; cmdBusy = false
+    isRunning = true; cmdBusy = false; busyMode = ''
     os.execute('mkdir -p ' .. TARGET_DIR)
+    os.execute('mkdir -p "' .. SCREENSHOT_DIR .. '"')
+    writeBridgeState(false, '', '')
     addLog('>>> Service Started')
 
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
-        cb = function() if isRunning then checkCommandRequest() end end })
+        cb = function()
+            if isRunning then
+                checkScreenshotRequest()
+                checkCommandRequest()
+            end
+        end })
     cmdTimer:resume()
 
     heartbeatTimer = lvgl.Timer({ period = 5000, repeat_count = -1,
@@ -489,13 +845,20 @@ local function stopService()
     if cmdTimer then cmdTimer:pause() end
     if heartbeatTimer then heartbeatTimer:pause() end
     if watchdogTimer then watchdogTimer:pause() end
+    cmdBusy = false
+    busyMode = ''
+    screenshotPending = false
+    screenshotReq = nil
+    screenshotWaitStartedAt = 0
+    screenshotPhase = ''
+    writeBridgeState(false, '', '')
     addLog('>>> Service Stopped')
     startStopBtn:set { text = "START", bg_color = '#004400', border_color = '#00ff00', text_color = '#00ff00' }
 end
 
 local function clearLog()
     statusBuffer = {}
-    local t = "=== Terminal Bridge ===\nStatus: " .. (isRunning and "RUNNING" or "STOPPED") .. "\nBusy: " .. tostring(cmdBusy) .. "\n" .. string.rep("-", 28) .. "\n"
+    local t = "=== Terminal Bridge ===\nStatus: " .. (isRunning and "RUNNING" or "STOPPED") .. "\nBusy: " .. tostring(cmdBusy) .. "\nMode: " .. (busyMode ~= '' and busyMode or '-') .. "\n" .. string.rep("-", 28) .. "\n"
     terminal:set { text = t }
 end
 
@@ -509,3 +872,29 @@ clearBtn:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
 -- ====== 初始状态 ======
 
 terminal:set { text = "=== Terminal Bridge ===\nStatus: STOPPED\n\nPress START\n\nDir: /data/quickapp/files/com.shell.liangyi/" }
+
+function ScreenStateChangedCB(pre, now, reason)
+    if not screenshotPending then
+        return
+    end
+    if pre ~= 'ON' and now == 'ON' then
+        screenshotPhase = 'capturing'
+        writeBridgeState(true, 'screenshot', '正在截图，请稍候')
+        writeScreenshotResult({
+            type = 'screenshot_result',
+            seq = screenshotReq and screenshotReq.seq or -1,
+            status = 'capturing',
+            message = '正在截图，请稍候',
+            timestamp = os.date('%H:%M:%S')
+        })
+        os.execute('sleep 1')
+        local item, err = captureScreenshot(screenshotReq or { seq = -1 })
+        if item then
+            addLog('[shot] saved #' .. tostring(item.index))
+            finishScreenshotSuccess(item)
+        else
+            addLog('[shot] failed: ' .. tostring(err))
+            finishScreenshotError(err or '截图失败')
+        end
+    end
+end
