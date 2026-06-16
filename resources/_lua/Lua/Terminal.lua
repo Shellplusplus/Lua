@@ -405,40 +405,92 @@ local function writeScreenshotResult(data)
     atomicWrite('screenshot_result.json', data)
 end
 
-local function readScreenshotHistory()
-    local content = readFile(TARGET_DIR .. 'screenshot_history.json')
-    if not content or content == '' then return {} end
-    local json = jsonDecode(content)
-    if type(json) ~= 'table' then return {} end
-    if json.items and type(json.items) == 'table' then
-        return json.items
-    end
-    return json
+local function buildScreenshotId(index, capturedAtUnix)
+    local timePart = os.date('%Y%m%d%H%M%S', capturedAtUnix or os.time())
+    return timePart .. '#' .. tostring(index)
 end
 
-local function writeScreenshotHistory(items)
-    return atomicWriteJson('screenshot_history.json', items)
+local function buildScreenshotFilename(shotId)
+    return (shotId:gsub('#', '_')) .. '.png'
+end
+
+local function normalizeScreenshotItems(items)
+    local normalized = {}
+    if type(items) ~= 'table' then
+        return normalized, 1
+    end
+    local seen = {}
+    local maxIndex = 0
+    for i = 1, #items do
+        local item = items[i]
+        if type(item) == 'table' and item.file then
+            local idx = tonumber(item.index) or i
+            if idx > maxIndex then
+                maxIndex = idx
+            end
+            local capturedAtUnix = tonumber(item.capturedAtUnix) or os.time()
+            item.index = idx
+            item.capturedAtUnix = capturedAtUnix
+            item.shotId = item.shotId or buildScreenshotId(idx, capturedAtUnix)
+            if not seen[item.shotId] then
+                seen[item.shotId] = true
+            normalized[#normalized + 1] = item
+            end
+        end
+    end
+    return normalized, maxIndex + 1
+end
+
+local function readScreenshotStore()
+    local content = readFile(TARGET_DIR .. 'screenshot_history.json')
+    if not content or content == '' then
+        return { items = {}, nextIndex = 1, lastItem = nil }
+    end
+    local json = jsonDecode(content)
+    if type(json) ~= 'table' then
+        return { items = {}, nextIndex = 1, lastItem = nil }
+    end
+    local items = json
+    if json.items and type(json.items) == 'table' then
+        items = json.items
+    end
+    local normalized, nextIndex = normalizeScreenshotItems(items)
+    local storedNextIndex = tonumber(json.nextIndex) or 0
+    if storedNextIndex < nextIndex then
+        storedNextIndex = nextIndex
+    end
+    return {
+        items = normalized,
+        nextIndex = storedNextIndex > 0 and storedNextIndex or nextIndex,
+        lastItem = normalized[1]
+    }
+end
+
+local function writeScreenshotStore(store)
+    return atomicWriteJson('screenshot_history.json', {
+        items = store.items or {},
+        nextIndex = tonumber(store.nextIndex) or 1,
+        lastItem = store.lastItem
+    })
 end
 
 local function nextScreenshotIndex()
-    local items = readScreenshotHistory()
-    local maxIndex = 0
-    for i = 1, #items do
-        local idx = tonumber(items[i] and items[i].index) or 0
-        if idx > maxIndex then
-            maxIndex = idx
-        end
-    end
-    return maxIndex + 1, items
+    local store = readScreenshotStore()
+    local nextIndex = tonumber(store.nextIndex) or 1
+    if nextIndex < 1 then nextIndex = 1 end
+    return nextIndex, store
 end
 
 local function appendScreenshotHistory(item)
-    local _, items = nextScreenshotIndex()
-    table.insert(items, 1, item)
-    while #items > SCREENSHOT_HISTORY_LIMIT do
-        table.remove(items)
+    local nextIndex, store = nextScreenshotIndex()
+    item.index = nextIndex
+    table.insert(store.items, 1, item)
+    while #store.items > SCREENSHOT_HISTORY_LIMIT do
+        table.remove(store.items)
     end
-    writeScreenshotHistory(items)
+    store.lastItem = store.items[1]
+    store.nextIndex = nextIndex + 1
+    writeScreenshotStore(store)
 end
 
 local function writePng(path, width, height, rgb888Data)
@@ -575,8 +627,10 @@ local function captureScreenshot(req)
     pcall(collectgarbage, 'collect')
 
     local index = nextScreenshotIndex()
-    local capturedAt = os.date('%Y-%m-%d %H:%M:%S')
-    local filename = string.format('shot_%03d_%s.png', index, os.date('%Y%m%d_%H%M%S'))
+    local capturedAtUnix = os.time()
+    local capturedAt = os.date('%Y-%m-%d %H:%M:%S', capturedAtUnix)
+    local shotId = buildScreenshotId(index, capturedAtUnix)
+    local filename = buildScreenshotFilename(shotId)
     local outPath = SCREENSHOT_DIR .. filename
     local quickPath = 'internal://files/screenshots/' .. filename
     local ok = writePng(outPath, SCREEN_W, SCREEN_H, rgbData)
@@ -592,9 +646,15 @@ local function captureScreenshot(req)
     local item = {
         seq = req.seq,
         index = index,
+        shotId = shotId,
         file = quickPath,
         name = filename,
-        capturedAt = capturedAt
+        capturedAt = capturedAt,
+        capturedAtUnix = capturedAtUnix,
+        requestTimestamp = tonumber(req.timestamp) or 0,
+        screenWidth = SCREEN_W,
+        screenHeight = SCREEN_H,
+        source = 'framebuffer'
     }
     appendScreenshotHistory(item)
     return item
@@ -654,7 +714,11 @@ local function readScreenshotRequest()
     if not json.seq then
         return nil
     end
-    return { seq = json.seq, type = 'screenshot' }
+    return {
+        seq = json.seq,
+        type = 'screenshot',
+        timestamp = json.timestamp
+    }
 end
 
 -- ====== 写入命令结果 ======
@@ -694,9 +758,15 @@ local function finishScreenshotSuccess(item)
         status = 'done',
         message = '截图完成',
         index = item.index,
+        shotId = item.shotId,
         file = item.file,
         name = item.name,
         capturedAt = item.capturedAt,
+        capturedAtUnix = item.capturedAtUnix,
+        requestTimestamp = item.requestTimestamp,
+        screenWidth = item.screenWidth,
+        screenHeight = item.screenHeight,
+        source = item.source,
         timestamp = os.date('%H:%M:%S')
     })
     writeBridgeState(false, '', '')
