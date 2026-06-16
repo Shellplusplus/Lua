@@ -10,6 +10,7 @@ local FB_PATH = '/dev/fb0'
 local SCREENSHOT_DIR = TARGET_DIR .. 'screenshots/'
 local SCREENSHOT_REQ_TIMEOUT = 30
 local SCREENSHOT_HISTORY_LIMIT = 20
+local LOG_HISTORY_LIMIT = 30
 local TMP_RAW = '/tmp/shell_screenshot.raw'
 local STRIDE_BYTES = SCREEN_W * 3
 
@@ -493,6 +494,135 @@ local function appendScreenshotHistory(item)
     writeScreenshotStore(store)
 end
 
+local function isLogRecordingEnabled()
+    local content = readFile(TARGET_DIR .. 'log_config.json')
+    if not content or content == '' then
+        return false
+    end
+    local json = jsonDecode(content)
+    return type(json) == 'table' and json.enabled == true
+end
+
+local function buildLuaLogFilename(logId)
+    return 'log_lua_' .. (logId:gsub('#', '_')) .. '.txt'
+end
+
+local function normalizeLuaLogItems(items)
+    local normalized = {}
+    if type(items) ~= 'table' then
+        return normalized, 1
+    end
+    local seen = {}
+    local maxIndex = 0
+    for i = 1, #items do
+        local item = items[i]
+        if type(item) == 'table' and (item.file or item.logId) then
+            local idx = tonumber(item.index) or i
+            if idx > maxIndex then
+                maxIndex = idx
+            end
+            local capturedAtUnix = tonumber(item.capturedAtUnix) or os.time()
+            local logId = item.logId or buildScreenshotId(idx, capturedAtUnix)
+            if not seen[logId] then
+                seen[logId] = true
+                item.index = idx
+                item.capturedAtUnix = capturedAtUnix
+                item.logId = logId
+                item.source = 'lua'
+                normalized[#normalized + 1] = item
+            end
+        end
+    end
+    return normalized, maxIndex + 1
+end
+
+local function readLuaLogStore()
+    local content = readFile(TARGET_DIR .. 'lua_log_history.json')
+    if not content or content == '' then
+        return { items = {}, nextIndex = 1, lastItem = nil }
+    end
+    local json = jsonDecode(content)
+    if type(json) ~= 'table' then
+        return { items = {}, nextIndex = 1, lastItem = nil }
+    end
+    local items = json.items and type(json.items) == 'table' and json.items or json
+    local normalized, nextIndex = normalizeLuaLogItems(items)
+    local storedNextIndex = tonumber(json.nextIndex) or 0
+    if storedNextIndex < nextIndex then
+        storedNextIndex = nextIndex
+    end
+    return {
+        items = normalized,
+        nextIndex = storedNextIndex > 0 and storedNextIndex or nextIndex,
+        lastItem = normalized[1]
+    }
+end
+
+local function writeLuaLogStore(store)
+    return atomicWriteJson('lua_log_history.json', {
+        items = store.items or {},
+        nextIndex = tonumber(store.nextIndex) or 1,
+        lastItem = store.lastItem
+    })
+end
+
+local function nextLuaLogIndex()
+    local store = readLuaLogStore()
+    local nextIndex = tonumber(store.nextIndex) or 1
+    if nextIndex < 1 then nextIndex = 1 end
+    return nextIndex, store
+end
+
+local function appendLuaLogEntry(title, summary, message)
+    if not isLogRecordingEnabled() then
+        return false
+    end
+    local nextIndex, store = nextLuaLogIndex()
+    local capturedAtUnix = os.time()
+    local capturedAt = os.date('%Y-%m-%d %H:%M:%S', capturedAtUnix)
+    local logId = buildScreenshotId(nextIndex, capturedAtUnix)
+    local filename = buildLuaLogFilename(logId)
+    local absPath = TARGET_DIR .. filename
+    local quickPath = 'internal://files/' .. filename
+    local content = title .. '\n\n'
+        .. '编号: ' .. logId .. '\n'
+        .. '时间: ' .. capturedAt .. '\n'
+        .. '来源: Lua\n'
+        .. (summary and summary ~= '' and ('摘要: ' .. summary .. '\n') or '')
+        .. '\n'
+        .. (message or '')
+
+    if not writeFile(absPath, content) then
+        return false
+    end
+
+    local item = {
+        index = nextIndex,
+        logId = logId,
+        file = quickPath,
+        name = filename,
+        capturedAt = capturedAt,
+        capturedAtUnix = capturedAtUnix,
+        source = 'lua',
+        title = title,
+        summary = summary or ''
+    }
+    table.insert(store.items, 1, item)
+    while #store.items > LOG_HISTORY_LIMIT do
+        table.remove(store.items)
+    end
+    store.lastItem = store.items[1]
+    store.nextIndex = nextIndex + 1
+    writeLuaLogStore(store)
+    return true
+end
+
+local function writeLuaEventLog(title, summary, message)
+    pcall(function()
+        appendLuaLogEntry(title, summary, message)
+    end)
+end
+
 local function writePng(path, width, height, rgb888Data)
     local fPng = io.open(path, 'wb')
     if not fPng then
@@ -683,6 +813,8 @@ local function readCommandRequest()
             local now = os.time()
             if now - lastParseError >= 5 then
                 addLog('[!] JSON parse error (retried)')
+                writeLuaEventLog('命令请求解析失败', 'cmd_request.json 解析失败',
+                    '文件: cmd_request.json\n说明: 连续两次读取后仍无法解析 JSON。')
                 lastParseError = now
             end
             return nil
@@ -735,6 +867,7 @@ end
 
 local function finishScreenshotError(message)
     local req = screenshotReq or { seq = -1 }
+    local phase = screenshotPhase
     writeScreenshotResult({
         type = 'screenshot_result',
         seq = req.seq,
@@ -742,6 +875,8 @@ local function finishScreenshotError(message)
         message = message,
         timestamp = os.date('%H:%M:%S')
     })
+    writeLuaEventLog('截图失败', message or '截图失败',
+        '序号: ' .. tostring(req.seq or -1) .. '\n阶段: ' .. tostring(phase ~= '' and phase or '-') .. '\n结果: ' .. tostring(message or '截图失败'))
     writeBridgeState(false, '', '')
     screenshotPending = false
     screenshotReq = nil
@@ -769,6 +904,11 @@ local function finishScreenshotSuccess(item)
         source = item.source,
         timestamp = os.date('%H:%M:%S')
     })
+    writeLuaEventLog('截图完成', item.shotId or '',
+        '序号: ' .. tostring(item.seq or -1)
+        .. '\n编号: ' .. tostring(item.shotId or '')
+        .. '\n文件: ' .. tostring(item.file or '')
+        .. '\n尺寸: ' .. tostring(item.screenWidth or 0) .. 'x' .. tostring(item.screenHeight or 0))
     writeBridgeState(false, '', '')
     screenshotPending = false
     screenshotReq = nil
@@ -795,6 +935,7 @@ local function prepareScreenshotRequest(req)
     })
     os.remove(TARGET_DIR .. 'screenshot_request.json')
     addLog('[shot] waiting for screen on')
+    writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n状态: 请熄屏后重新亮屏')
 end
 
 -- ====== 看门狗：检测命令超时 ======
@@ -815,6 +956,10 @@ local function watchdogCheck()
     local timedOutCmd = currentCmd
     local timedOutReq = currentReq
     addLog('[!] Command timed out: ' .. timedOutCmd)
+    writeLuaEventLog('命令执行超时', timedOutCmd or '',
+        '序号: ' .. tostring(timedOutReq and timedOutReq.seq or -1)
+        .. '\n命令: ' .. tostring(timedOutCmd or '')
+        .. '\n超时: ' .. tostring(CMD_TIMEOUT) .. 'ms')
 
     local res = {
         type = 'cmd_result',
@@ -861,6 +1006,17 @@ local function checkCommandRequest()
     writeBridgeState(true, 'cmd', '命令执行中')
     local result = executeShellCommand(req.cmd)
     writeCommandResult(req, result)
+    local stdoutPreview = result.stdout or ''
+    if #stdoutPreview > 2048 then
+        stdoutPreview = stdoutPreview:sub(1, 2048) .. '\n...[truncated]'
+    end
+    writeLuaEventLog('命令执行', req.cmd or '',
+        '序号: ' .. tostring(req.seq or -1)
+        .. '\n命令: ' .. tostring(req.cmd or '')
+        .. '\n退出码: ' .. tostring(result.exitcode or -1)
+        .. '\nstdout字节: ' .. tostring(#(result.stdout or ''))
+        .. '\nstderr字节: ' .. tostring(#(result.stderr or ''))
+        .. '\n\n输出预览:\n' .. stdoutPreview)
     cmdBusy = false
     busyMode = ''
     writeBridgeState(false, '', '')
@@ -888,6 +1044,8 @@ local function startService()
     os.execute('mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
     addLog('>>> Service Started')
+    writeLuaEventLog('服务启动', 'Terminal Bridge 已启动',
+        '目录: ' .. TARGET_DIR .. '\n屏幕: ' .. tostring(SCREEN_W) .. 'x' .. tostring(SCREEN_H))
 
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
@@ -923,6 +1081,7 @@ local function stopService()
     screenshotPhase = ''
     writeBridgeState(false, '', '')
     addLog('>>> Service Stopped')
+    writeLuaEventLog('服务停止', 'Terminal Bridge 已停止', '目录: ' .. TARGET_DIR)
     startStopBtn:set { text = "START", bg_color = '#004400', border_color = '#00ff00', text_color = '#00ff00' }
 end
 
