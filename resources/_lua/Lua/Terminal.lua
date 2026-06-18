@@ -460,7 +460,9 @@ local function resolveTargetDirByDeviceInfo()
     local product = tostring(latest.product or '')
     local chosenDir = latest._sourceDir or BAND10_PRO_DIR
 
-    if product == 'Xiaomi Smart Band 9 Pro' then
+    if product == 'Xiaomi Smart Band 9 Pro'
+        or product == 'Xiaomi Watch S4'
+        or product == 'Xiaomi Watch S4 41mm' then
         chosenDir = BAND9_PRO_DIR
     elseif product == 'Xiaomi Smart Band 10 Pro' then
         chosenDir = BAND10_PRO_DIR
