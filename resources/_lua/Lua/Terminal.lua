@@ -5,6 +5,7 @@
 local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local BAND10_PRO_DIR = '/data//files//com.shell.liangyi/'
 local DEVICE_INFO_FILE = 'device_info.json'
+local SCREENSHOT_DEBUG_FILE = 'screenshot_debug.json'
 local TARGET_DIR = BAND10_PRO_DIR
 local CMD_TIMEOUT = 10000  -- 命令超时：10 秒
 local SCREEN_W = lvgl.HOR_RES()
@@ -204,6 +205,14 @@ end
 
 local function writeFile(path, content)
     local ok, f = pcall(io.open, path, 'w')
+    if not ok or not f then return false end
+    f:write(content)
+    f:close()
+    return true
+end
+
+local function writeBinaryFile(path, content)
+    local ok, f = pcall(io.open, path, 'wb')
     if not ok or not f then return false end
     f:write(content)
     f:close()
@@ -560,6 +569,14 @@ local function buildScreenshotFilename(shotId)
     return (shotId:gsub('#', '_')) .. '.png'
 end
 
+local function buildScreenshotRawFilename(shotId)
+    return (shotId:gsub('#', '_')) .. '.raw'
+end
+
+local function buildScreenshotMetaFilename(shotId)
+    return (shotId:gsub('#', '_')) .. '.json'
+end
+
 local function normalizeScreenshotItems(items)
     local normalized = {}
     if type(items) ~= 'table' then
@@ -637,6 +654,20 @@ local function appendScreenshotHistory(item)
     store.lastItem = store.items[1]
     store.nextIndex = nextIndex + 1
     writeScreenshotStore(store)
+end
+
+local function getScreenshotDebugConfig()
+    local content = readFile(TARGET_DIR .. SCREENSHOT_DEBUG_FILE)
+    if not content or content == '' then
+        return { saveRaw = false }
+    end
+    local json = jsonDecode(content)
+    if type(json) ~= 'table' then
+        return { saveRaw = false }
+    end
+    return {
+        saveRaw = json.saveRaw == true
+    }
 end
 
 local function isLogRecordingEnabled()
@@ -897,39 +928,79 @@ local function captureScreenshot(req)
         return nil, '截图数据不足'
     end
 
-    local rgbData = extractRgb888(rawData)
-    rawData = nil
-    pcall(collectgarbage, 'collect')
-
     local index = nextScreenshotIndex()
     local capturedAtUnix = os.time()
     local capturedAt = os.date('%Y-%m-%d %H:%M:%S', capturedAtUnix)
     local shotId = buildScreenshotId(index, capturedAtUnix)
-    local filename = buildScreenshotFilename(shotId)
-    local outPath = SCREENSHOT_DIR .. filename
-    local quickPath = 'internal://files/screenshots/' .. filename
-    local ok = writePng(outPath, SCREEN_W, SCREEN_H, rgbData)
-    rgbData = nil
+    local debugConfig = getScreenshotDebugConfig()
+    local filename = ''
+    local outPath = ''
+    local quickPath = ''
+    local metaFile = ''
+    local metaQuickPath = ''
+    local ok = false
+    local source = 'framebuffer'
+    local message = '截图完成'
+
+    if debugConfig.saveRaw then
+        filename = buildScreenshotRawFilename(shotId)
+        outPath = SCREENSHOT_DIR .. filename
+        quickPath = 'internal://files/screenshots/' .. filename
+        metaFile = buildScreenshotMetaFilename(shotId)
+        metaQuickPath = 'internal://files/screenshots/' .. metaFile
+        ok = writeBinaryFile(outPath, rawData)
+        if not ok then
+            removeFile(TMP_RAW)
+            return nil, '原始像素写入失败'
+        end
+        writeFile(SCREENSHOT_DIR .. metaFile, jsonEncode({
+            shotId = shotId,
+            capturedAt = capturedAt,
+            capturedAtUnix = capturedAtUnix,
+            screenWidth = SCREEN_W,
+            screenHeight = SCREEN_H,
+            strideBytes = STRIDE_BYTES,
+            rawBytes = #rawData,
+            pixelFormatGuess = 'bgr888',
+            source = 'framebuffer_raw'
+        }))
+        source = 'framebuffer_raw'
+        message = '原始像素已保存'
+    else
+        local rgbData = extractRgb888(rawData)
+        rawData = nil
+        pcall(collectgarbage, 'collect')
+        filename = buildScreenshotFilename(shotId)
+        outPath = SCREENSHOT_DIR .. filename
+        quickPath = 'internal://files/screenshots/' .. filename
+        ok = writePng(outPath, SCREEN_W, SCREEN_H, rgbData)
+        rgbData = nil
+        if not ok then
+            removeFile(TMP_RAW)
+            pcall(collectgarbage, 'collect')
+            return nil, 'PNG 写入失败'
+        end
+    end
+
+    rawData = nil
     removeFile(TMP_RAW)
     pcall(collectgarbage, 'collect')
     os.execute('sync')
-
-    if not ok then
-        return nil, 'PNG 写入失败'
-    end
 
     local item = {
         seq = req.seq,
         index = index,
         shotId = shotId,
         file = quickPath,
+        metaFile = metaQuickPath,
         name = filename,
         capturedAt = capturedAt,
         capturedAtUnix = capturedAtUnix,
         requestTimestamp = tonumber(req.timestamp) or 0,
         screenWidth = SCREEN_W,
         screenHeight = SCREEN_H,
-        source = 'framebuffer'
+        source = source,
+        message = message
     }
     appendScreenshotHistory(item)
     return item
@@ -1036,10 +1107,11 @@ local function finishScreenshotSuccess(item)
         type = 'screenshot_result',
         seq = item.seq,
         status = 'done',
-        message = '截图完成',
+        message = item.message or '截图完成',
         index = item.index,
         shotId = item.shotId,
         file = item.file,
+        metaFile = item.metaFile,
         name = item.name,
         capturedAt = item.capturedAt,
         capturedAtUnix = item.capturedAtUnix,
