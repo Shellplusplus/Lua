@@ -2,7 +2,10 @@
 -- Shell 终端桥接表盘
 -- 接收快应用的命令请求 → os.execute → 写回结果
 
-local TARGET_DIR = '/data/quickapp/files/com.shell.liangyi/'
+local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
+local BAND10_PRO_DIR = '/data//files//com.shell.liangyi/'
+local DEVICE_INFO_FILE = 'device_info.json'
+local TARGET_DIR = BAND10_PRO_DIR
 local CMD_TIMEOUT = 10000  -- 命令超时：10 秒
 local SCREEN_W = lvgl.HOR_RES()
 local SCREEN_H = lvgl.VER_RES()
@@ -30,65 +33,164 @@ local screenshotPending = false
 local screenshotReq = nil
 local screenshotWaitStartedAt = 0
 local screenshotPhase = ''
+local activeDeviceProduct = '-'
+local activeDeviceModel = '-'
+local activeDeviceSourceDir = ''
 
 -- ====== UI ======
+-- 视觉风格对齐 Vela 快应用：纯黑背景 + 深灰圆角卡片 + 蓝色主操作
+-- 布局遵循 luaexample 规范：
+--   1) Object 容器只用绝对坐标 (x, y)，绝不设 align；Label 才用 align
+--   2) 容器统一 pad_all = 0，消除默认内边距造成的偏移/溢出
+--   3) 非交互容器/标签 add_flag(EVENT_BUBBLE) 做点击穿透，事件冒泡到目标按钮
+--   4) 切页用 root:clean() 清空后重建（单文件双页面：home 表盘 / shell 终端）
+local UI_BG        = '#000000'  -- 页面背景
+local UI_CARD      = '#262626'  -- 卡片/次按钮
+local UI_PRIMARY   = '#0D6EFF'  -- 主操作（START）
+local UI_DANGER    = '#D93A2F'  -- 运行中（STOP）
+local UI_TEXT      = '#ffffff'  -- 主文字
+local UI_TERM_TEXT = '#d6d6d6'  -- 日志文字
+local UI_DIM       = '#888888'  -- 次要信息
+local UI_CLAUDE    = '#D97757'  -- Claude 品牌橙
 
+-- 版面尺寸（针对 336x480 调校）
+local UI_GAP = 12               -- 统一外边距/间距
+local UI_CARD_RADIUS = 24       -- 卡片圆角
+local UI_BTN_H = 48             -- 按钮高度（缩小按钮，释放终端空间）
+local UI_BTN_RADIUS = math.floor(UI_BTN_H / 2)  -- 胶囊按钮
+local UI_TOPBAR_H = 56          -- 顶部返回/标题栏高度（紧凑）
+local HOME_PAD = 20             -- 表盘数据左边距
+
+-- 当前页面与各页面控件引用（切页后重建，故用 forward 局部，配合 nil 守卫）
+local currentPage = 'home'      -- 'home' | 'shell'
+local terminal = nil
+local startBtn = nil
+local startBtnLabel = nil
+local clearBtn = nil
+local timeLabel = nil
+local dateLabel = nil
+local weekLabel = nil
+local spriteCells = nil         -- 像素方块网格（lvgl.Object 数组）
+local spriteFrame = 0
+local clockTimer = nil
+local spriteTimer = nil
+local buildHomePage, buildShellPage   -- 互相跳转，提前声明
+
+-- 根容器只创建一次；切页时 root:clean() 重建子节点，flag 保留在 root 上
 local root = lvgl.Object(nil, {
-    w = lvgl.HOR_RES(),
-    h = lvgl.VER_RES(),
-    align = lvgl.ALIGN.CENTER,
+    x = 0, y = 0,
+    w = SCREEN_W, h = SCREEN_H,
+    bg_color = UI_BG,
     border_width = 0,
-    bg_color = '#000000',
+    pad_all = 0,
 })
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
+root:add_flag(lvgl.FLAG.EVENT_BUBBLE)  -- 点击穿透
 
-lvgl.Label(root, {
-    x = 0, y = 2,
-    w = lvgl.HOR_RES(), h = 28,
-    text = "Terminal Bridge",
-    font_size = 16,
-    text_color = '#00ff00',
-    align = lvgl.ALIGN.CENTER,
-})
+-- ====== 像素精灵：用 12x12 方块网格渲染（每格一个 lvgl.Object，不依赖字体字形）======
+-- 每次亮屏随机显示小猫或 Claude 火花，逐帧改变方块的颜色/透明度形成动画；不标注名称
+local SPRITE_COLS = 14          -- 网格列数（横向，左右各比原来宽一格）
+local SPRITE_ROWS = 12          -- 网格行数（纵向）
+local SPRITE_CELL = 20          -- 每格方块尺寸（px，实体无间隙）
 
-local terminal = lvgl.Textarea(root, {
-    w = lvgl.HOR_RES() - 10,
-    h = lvgl.VER_RES() - 110,
-    x = 5,
-    y = 32,
-    text = '',
-    bg_color = '#000000',
-    font_size = 18,
-    text_color = '#00ff00',
-    border_width = 0
-})
-terminal:clear_flag(lvgl.FLAG.SCROLLABLE)
+-- Claude Code 精灵（参考用户提供的轮廓 ▐▛███▜▌ ▝▜█████▛▘ ▘▘ ▝▝）
+-- 方块像素造型：平顶身体 + 左右两侧伸出的手臂 + 两只黑方眼 + 底部带缝隙的小脚
+-- 'O'=身体橙，'P'=黑眼，其余空白；待机形象左右对称
+-- 特效：眼睛变化（正常 ↔ 眨眼 ↔ 看向一侧）
+local CLAUDE_NORMAL = {
+    "..............",
+    "..OOOOOOOOOO..",
+    "..OOOOOOOOOO..",
+    "..OOPOOOOPOO..",
+    "..OOPOOOOPOO..",
+    "OOOOOOOOOOOOOO",
+    "OOOOOOOOOOOOOO",
+    "..OOOOOOOOOO..",
+    "..OOOOOOOOOO..",
+    "...O.O..O.O...",
+    "...O.O..O.O...",
+    "..............",
+}
+local CLAUDE_BLINK = {
+    "..............",
+    "..OOOOOOOOOO..",
+    "..OOOOOOOOOO..",
+    "..OOPOOOOOOO..",
+    "..OOPOOOOPOO..",
+    "OOOOOOOOOOOOOO",
+    "OOOOOOOOOOOOOO",
+    "..OOOOOOOOOO..",
+    "..OOOOOOOOOO..",
+    "...O.O..O.O...",
+    "...O.O..O.O...",
+    "..............",
+}
+local CLAUDE_LOOK = {
+    "..............",
+    "..OOOOOOOOOO..",
+    "..OOOOOOOOOO..",
+    "..OOPOOOOPOO..",
+    "..OOPOOOOPOO..",
+    "OOOOOOOOOOOOOO",
+    "OOOOOOOOOOOOOO",
+    "..OOOOOOOOOO..",
+    "..OOOOOOOOOO..",
+    "...O.O..O.O...",
+    "...O.O..O.O...",
+    "..............",
+}
 
-local controlPanel = lvgl.Object(root, {
-    x = 0,
-    y = lvgl.VER_RES() - 72,
-    w = lvgl.HOR_RES(),
-    h = 72,
-    bg_color = '#111111',
-    border_width = 0
-})
-controlPanel:clear_flag(lvgl.FLAG.SCROLLABLE)
+local CRAB_SPRITE = {
+    palette = { ['O'] = UI_CLAUDE, ['H'] = '#F0A070', ['W'] = '#ffffff', ['P'] = '#222222', ['L'] = '#B05530', ['-'] = '#F0A070' },
+    frames = { CLAUDE_NORMAL, CLAUDE_NORMAL, CLAUDE_BLINK, CLAUDE_LOOK },
+}
 
-local startStopBtn = lvgl.Label(controlPanel, {
-    x = 10, y = 5, w = 100, h = 40,
-    text = "START", radius = 5,
-    border_width = 1, border_color = '#00ff00',
-    bg_color = '#004400', font_size = 28, text_color = '#00ff00'
-})
-startStopBtn:add_flag(lvgl.FLAG.CLICKABLE)
+local function resetSprite()
+    spriteFrame = 0
+end
 
-local clearBtn = lvgl.Label(controlPanel, {
-    x = 120, y = 5, w = 100, h = 40,
-    text = "CLEAR", radius = 5,
-    border_width = 1, border_color = '#ffaa00',
-    bg_color = '#443300', font_size = 28, text_color = '#ffaa00'
-})
-clearBtn:add_flag(lvgl.FLAG.CLICKABLE)
+local function renderSprite()
+    if not spriteCells then return end
+    local grid = CRAB_SPRITE.frames[(spriteFrame % #CRAB_SPRITE.frames) + 1]
+    local palette = CRAB_SPRITE.palette
+    for r = 1, SPRITE_ROWS do
+        local rowStr = grid[r] or ''
+        for c = 1, SPRITE_COLS do
+            local cell = spriteCells[(r - 1) * SPRITE_COLS + c]
+            if cell then
+                local color = palette[rowStr:sub(c, c)]
+                if color then
+                    cell:set { bg_color = color, bg_opa = 255 }
+                else
+                    cell:set { bg_opa = 0 }
+                end
+            end
+        end
+    end
+end
+
+local function updateClock()
+    if currentPage ~= 'home' or not timeLabel then return end
+    timeLabel:set { text = os.date('%H:%M') }
+end
+
+-- ====== 终端日志渲染（shell 页存在时才刷新；切到 home 后安全 no-op）======
+local function buildTerminalText()
+    local t = "shell++\n"
+    t = t .. "Status: " .. (isRunning and "RUNNING" or "STOPPED") .. "\n"
+    t = t .. "Busy: " .. tostring(cmdBusy) .. "\n"
+    t = t .. "Mode: " .. (busyMode ~= '' and busyMode or '-') .. "\n"
+    t = t .. "设备: " .. tostring(activeDeviceProduct or '-') .. " | " .. tostring(TARGET_DIR or '-') .. "\n"
+    t = t .. string.rep("-", 28) .. "\n"
+    for i = 1, #statusBuffer do
+        t = t .. statusBuffer[i] .. "\n"
+    end
+    return t
+end
+
+local function refreshTerminal()
+    if terminal then terminal:set { text = buildTerminalText() } end
+end
 
 -- ====== 工具函数 ======
 
@@ -118,6 +220,11 @@ local function removeFile(path)
     pcall(os.remove, path)
 end
 
+local function setTargetDir(path)
+    TARGET_DIR = path
+    SCREENSHOT_DIR = TARGET_DIR .. 'screenshots/'
+end
+
 local function mkdir(path)
     os.execute('mkdir -p "' .. path .. '"')
 end
@@ -139,15 +246,7 @@ end
 local function addLog(line)
     table.insert(statusBuffer, 1, line)
     while #statusBuffer > 25 do table.remove(statusBuffer) end
-    local t = "=== Terminal Bridge ===\n"
-    t = t .. "Status: " .. (isRunning and "RUNNING" or "STOPPED") .. "\n"
-    t = t .. "Busy: " .. tostring(cmdBusy) .. "\n"
-    t = t .. "Mode: " .. (busyMode ~= '' and busyMode or '-') .. "\n"
-    t = t .. string.rep("-", 28) .. "\n"
-    for i = 1, #statusBuffer do
-        t = t .. statusBuffer[i] .. "\n"
-    end
-    terminal:set { text = t }
+    refreshTerminal()
 end
 
 -- ====== JSON ======
@@ -328,6 +427,50 @@ local function jsonDecode(json)
     end)
     if not ok then return nil end
     return result
+end
+
+local function readDeviceInfoFrom(dir)
+    local content = readFile(dir .. DEVICE_INFO_FILE)
+    if not content or content == '' then return nil end
+    local data = jsonDecode(content)
+    if type(data) ~= 'table' then return nil end
+    data._sourceDir = dir
+    data._updatedAtUnix = tonumber(data.updatedAtUnix) or tonumber(data.timestamp) or 0
+    return data
+end
+
+local function resolveTargetDirByDeviceInfo()
+    local candidates = { BAND9_PRO_DIR, BAND10_PRO_DIR }
+    local latest = nil
+
+    for _, dir in ipairs(candidates) do
+        local data = readDeviceInfoFrom(dir)
+        if data and (not latest or data._updatedAtUnix >= latest._updatedAtUnix) then
+            latest = data
+        end
+    end
+
+    if not latest then
+        activeDeviceProduct = '-'
+        activeDeviceModel = '-'
+        activeDeviceSourceDir = ''
+        return false, '请打开快应用获取设备信息后再试'
+    end
+
+    local product = tostring(latest.product or '')
+    local chosenDir = latest._sourceDir or BAND10_PRO_DIR
+
+    if product == 'Xiaomi Smart Band 9 Pro' then
+        chosenDir = BAND9_PRO_DIR
+    elseif product == 'Xiaomi Smart Band 10 Pro' then
+        chosenDir = BAND10_PRO_DIR
+    end
+
+    setTargetDir(chosenDir)
+    activeDeviceProduct = product ~= '' and product or '-'
+    activeDeviceModel = tostring(latest.model or '-')
+    activeDeviceSourceDir = tostring(latest._sourceDir or chosenDir)
+    return true
 end
 
 -- ====== 原子写入 ======
@@ -1039,13 +1182,22 @@ end
 
 local function startService()
     if isRunning then return end
+    local ok, msg = resolveTargetDirByDeviceInfo()
+    if not ok then
+        addLog(msg)
+        return
+    end
     isRunning = true; cmdBusy = false; busyMode = ''
     os.execute('mkdir -p ' .. TARGET_DIR)
     os.execute('mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
     addLog('>>> Service Started')
     writeLuaEventLog('服务启动', 'Terminal Bridge 已启动',
-        '目录: ' .. TARGET_DIR .. '\n屏幕: ' .. tostring(SCREEN_W) .. 'x' .. tostring(SCREEN_H))
+        '设备代号: ' .. activeDeviceProduct
+        .. '\n设备型号: ' .. activeDeviceModel
+        .. '\n读取目录: ' .. activeDeviceSourceDir
+        .. '\n工作目录: ' .. TARGET_DIR
+        .. '\n屏幕: ' .. tostring(SCREEN_W) .. 'x' .. tostring(SCREEN_H))
 
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
@@ -1064,7 +1216,8 @@ local function startService()
         cb = function() if isRunning then watchdogCheck() end end })
     watchdogTimer:resume()
 
-    startStopBtn:set { text = "STOP", bg_color = '#440000', border_color = '#ff0000', text_color = '#ff0000' }
+    if startBtn then startBtn:set { bg_color = UI_DANGER } end
+    if startBtnLabel then startBtnLabel:set { text = "STOP", text_color = UI_TEXT } end
 end
 
 local function stopService()
@@ -1082,27 +1235,210 @@ local function stopService()
     writeBridgeState(false, '', '')
     addLog('>>> Service Stopped')
     writeLuaEventLog('服务停止', 'Terminal Bridge 已停止', '目录: ' .. TARGET_DIR)
-    startStopBtn:set { text = "START", bg_color = '#004400', border_color = '#00ff00', text_color = '#00ff00' }
+    if startBtn then startBtn:set { bg_color = UI_PRIMARY } end
+    if startBtnLabel then startBtnLabel:set { text = "START", text_color = UI_TEXT } end
 end
 
 local function clearLog()
     statusBuffer = {}
-    local t = "=== Terminal Bridge ===\nStatus: " .. (isRunning and "RUNNING" or "STOPPED") .. "\nBusy: " .. tostring(cmdBusy) .. "\nMode: " .. (busyMode ~= '' and busyMode or '-') .. "\n" .. string.rep("-", 28) .. "\n"
-    terminal:set { text = t }
+    refreshTerminal()
 end
 
--- ====== 按钮事件 ======
+-- ====== 页面构建（单文件双页面，切页用 root:clean() 重建）======
 
-startStopBtn:onevent(lvgl.EVENT.CLICKED, function()
-    if isRunning then stopService() else startService() end
-end)
-clearBtn:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
+-- home：表盘页。上半屏居中显示时间；下半屏居中随机一只动态精灵，点击进入 shell
+buildHomePage = function()
+    currentPage = 'home'
+    -- shell 页控件已随 root:clean() 销毁，引用置空以触发各刷新函数的 nil 守卫
+    terminal = nil
+    startBtn = nil
+    startBtnLabel = nil
+    clearBtn = nil
+    root:clean()
 
--- ====== 初始状态 ======
+    -- 时间：在上半屏水平+垂直居中显示（仅时间，不再显示日期/星期）
+    timeLabel = lvgl.Label(root, {
+        x = 0, y = math.floor((math.floor(SCREEN_H / 2) - 120) / 2),
+        text = os.date('%H:%M'),
+        text_font = lvgl.Font("MiSans-Regular", 120),
+        text_color = UI_TEXT,
+        align = lvgl.ALIGN.TOP_MID,
+    })
 
-terminal:set { text = "=== Terminal Bridge ===\nStatus: STOPPED\n\nPress START\n\nDir: /data/quickapp/files/com.shell.liangyi/" }
+    -- 下半屏精灵容器（绝对坐标，不设 align；可点击 → 进入 shell）
+    local spriteBox = lvgl.Object(root, {
+        x = 0, y = math.floor(SCREEN_H / 2),
+        w = SCREEN_W, h = math.floor(SCREEN_H / 2),
+        bg_opa = 0,
+        border_width = 0,
+        pad_all = 0,
+    })
+    spriteBox:clear_flag(lvgl.FLAG.SCROLLABLE)
+    spriteBox:add_flag(lvgl.FLAG.CLICKABLE)
+    spriteBox:onevent(lvgl.EVENT.CLICKED, function() buildShellPage() end)
+
+    -- 预建 12x12 方块网格并在下半屏居中；动画只改方块颜色/透明度，不重建
+    spriteCells = {}
+    local spanW = SPRITE_COLS * SPRITE_CELL
+    local spanH = SPRITE_ROWS * SPRITE_CELL
+    local originX = math.floor((SCREEN_W - spanW) / 2)
+    local originY = math.floor((math.floor(SCREEN_H / 2) - spanH) / 2)
+    for r = 1, SPRITE_ROWS do
+        for c = 1, SPRITE_COLS do
+            local cell = lvgl.Object(spriteBox, {
+                x = originX + (c - 1) * SPRITE_CELL,
+                y = originY + (r - 1) * SPRITE_CELL,
+                w = SPRITE_CELL, h = SPRITE_CELL,
+                bg_color = UI_TEXT,
+                bg_opa = 0,
+                border_width = 0,
+                radius = 0,
+                pad_all = 0,
+            })
+            cell:clear_flag(lvgl.FLAG.SCROLLABLE)
+            cell:add_flag(lvgl.FLAG.EVENT_BUBBLE)  -- 点击穿透到容器 → 进入 shell
+            spriteCells[(r - 1) * SPRITE_COLS + c] = cell
+        end
+    end
+
+    resetSprite()
+    renderSprite()
+    updateClock()
+end
+
+-- shell：终端页。左侧返回按钮、右侧标题 shell++；中部日志卡片；底部 START/STOP、CLEAR
+buildShellPage = function()
+    currentPage = 'shell'
+    timeLabel = nil
+    dateLabel = nil
+    weekLabel = nil
+    spriteCells = nil
+    root:clean()
+
+    -- 顶栏：左返回按钮（圆形：宽高相等、半径取一半）
+    local backDiam = UI_TOPBAR_H - UI_GAP
+    local backBtn = lvgl.Object(root, {
+        x = UI_GAP, y = UI_GAP,
+        w = backDiam, h = backDiam,
+        bg_color = UI_CARD,
+        radius = math.floor(backDiam / 2),
+        border_width = 0,
+        pad_all = 0,
+    })
+    backBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    backBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    local backLbl = lvgl.Label(backBtn, {
+        align = lvgl.ALIGN.CENTER,
+        text = '<',
+        text_font = lvgl.Font("MiSans-Regular", 32),
+        text_color = UI_TEXT,
+    })
+    backLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    backBtn:onevent(lvgl.EVENT.CLICKED, function() buildHomePage() end)
+
+    -- 顶栏：右标题，Label 用 align 靠右；垂直下移与圆形返回按钮居中对齐
+    lvgl.Label(root, {
+        x = 220, y = 12,
+        text = 'shell++',
+        text_font = lvgl.Font("MiSans-Regular", 32),
+        text_color = UI_TEXT,
+    })
+
+    -- 底部按钮：缩小按钮，释放终端空间
+    local panelY = SCREEN_H - UI_GAP - UI_BTN_H
+    local TERM_TOP = UI_TOPBAR_H + UI_GAP
+    local btnW = math.floor((SCREEN_W - UI_GAP * 3) / 2)
+
+    terminal = lvgl.Textarea(root, {
+        x = UI_GAP, y = TERM_TOP,
+        w = SCREEN_W - UI_GAP * 2,
+        h = panelY - UI_GAP - TERM_TOP,
+        text = '',
+        bg_color = UI_CARD,
+        radius = UI_CARD_RADIUS,
+        text_font = lvgl.Font("MiSans-Regular", 20),
+        text_color = UI_TERM_TEXT,
+        border_width = 0,
+        pad_all = 14,
+    })
+    terminal:clear_flag(lvgl.FLAG.SCROLLABLE)
+    terminal:clear_flag(lvgl.FLAG.CLICKABLE)
+    terminal:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+
+    startBtn = lvgl.Object(root, {
+        x = UI_GAP, y = panelY,
+        w = btnW, h = UI_BTN_H,
+        bg_color = isRunning and UI_DANGER or UI_PRIMARY,
+        radius = UI_BTN_RADIUS,
+        border_width = 0,
+        pad_all = 0,
+    })
+    startBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    startBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    startBtnLabel = lvgl.Label(startBtn, {
+        align = lvgl.ALIGN.CENTER,
+        text = isRunning and 'STOP' or 'START',
+        text_font = lvgl.Font("MiSans-Regular", 28),
+        text_color = UI_TEXT,
+    })
+    startBtnLabel:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    startBtn:onevent(lvgl.EVENT.CLICKED, function()
+        if isRunning then stopService() else startService() end
+    end)
+
+    clearBtn = lvgl.Object(root, {
+        x = UI_GAP * 2 + btnW, y = panelY,
+        w = btnW, h = UI_BTN_H,
+        bg_color = UI_CARD,
+        radius = UI_BTN_RADIUS,
+        border_width = 0,
+        pad_all = 0,
+    })
+    clearBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    clearBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    local clearLbl = lvgl.Label(clearBtn, {
+        align = lvgl.ALIGN.CENTER,
+        text = 'CLEAR',
+        text_font = lvgl.Font("MiSans-Regular", 28),
+        text_color = UI_TEXT,
+    })
+    clearLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    clearBtn:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
+
+    refreshTerminal()
+end
+
+-- ====== 启动：动画/时钟定时器（常驻，靠 currentPage 守卫）+ 默认进入表盘 ======
+
+math.randomseed(os.time())
+
+clockTimer = lvgl.Timer({ period = 1000, repeat_count = -1,
+    cb = function() updateClock() end })
+clockTimer:resume()
+
+spriteTimer = lvgl.Timer({ period = 450, repeat_count = -1,
+    cb = function()
+        if currentPage ~= 'home' or not spriteCells then return end
+        spriteFrame = spriteFrame + 1
+        renderSprite()
+    end })
+spriteTimer:resume()
+
+do
+    local ok, msg = resolveTargetDirByDeviceInfo()
+    if not ok and msg then
+        addLog(msg)
+    end
+end
+
+buildHomePage()
 
 function ScreenStateChangedCB(pre, now, reason)
+    if pre ~= 'ON' and now == 'ON' and currentPage == 'home' then
+        resetSprite()
+        renderSprite()
+        updateClock()
+    end
     if not screenshotPending then
         return
     end
