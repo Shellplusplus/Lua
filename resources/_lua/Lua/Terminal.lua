@@ -1,6 +1,6 @@
 -- Terminal.lua
 -- Shell 终端桥接表盘
--- 接收快应用的命令请求 → os.execute → 写回结果
+-- 接收快应用的命令/截图/性能模式请求 → 执行后写回结果
 
 local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local BAND10_PRO_DIR = '/data//files//com.shell.liangyi/'
@@ -37,6 +37,9 @@ local screenshotPhase = ''
 local activeDeviceProduct = '-'
 local activeDeviceModel = '-'
 local activeDeviceSourceDir = ''
+local ipcGuardToken = ''
+local ipcGuardSeq = 0
+local writeLuaEventLog
 
 -- ====== UI ======
 -- 视觉风格对齐 Vela 快应用：纯黑背景 + 深灰圆角卡片 + 蓝色主操作
@@ -44,7 +47,7 @@ local activeDeviceSourceDir = ''
 --   1) Object 容器只用绝对坐标 (x, y)，绝不设 align；Label 才用 align
 --   2) 容器统一 pad_all = 0，消除默认内边距造成的偏移/溢出
 --   3) 非交互容器/标签 add_flag(EVENT_BUBBLE) 做点击穿透，事件冒泡到目标按钮
---   4) 切页用 root:clean() 清空后重建（单文件双页面：home 表盘 / shell 终端）
+--   4) 切页用 root:clean() 清空后重建（单文件页面：home / shell；用户操作放在 QuickApp）
 local UI_BG        = '#000000'  -- 页面背景
 local UI_CARD      = '#262626'  -- 卡片/次按钮
 local UI_PRIMARY   = '#0D6EFF'  -- 主操作（START）
@@ -222,6 +225,15 @@ end
 local function fileExists(path)
     local ok, f = pcall(io.open, path, 'r')
     if ok and f then f:close(); return true end
+    return false
+end
+
+local function dirExists(path)
+    local ok, dir = pcall(function() return lvgl.fs.open_dir(path) end)
+    if ok and dir then
+        dir:close()
+        return true
+    end
     return false
 end
 
@@ -526,11 +538,102 @@ local function writeBridgeState(busy, mode, message)
     })
 end
 
+local function buildIpcGuardToken()
+    local t = tostring(os.time())
+    local c = tostring(os.clock() or 0)
+    local r1 = tostring(math.random(100000, 999999))
+    local r2 = tostring(math.random(100000, 999999))
+    return t .. '-' .. c .. '-' .. r1 .. '-' .. r2
+end
+
+local function rotateIpcGuard()
+    ipcGuardSeq = ipcGuardSeq + 1
+    ipcGuardToken = buildIpcGuardToken()
+    atomicWrite('ipc_guard.json', {
+        type = 'ipc_guard',
+        seq = ipcGuardSeq,
+        token = ipcGuardToken,
+        timestamp = tostring(os.time())
+    })
+end
+
+local function ensureIpcGuard()
+    if ipcGuardToken == '' then
+        rotateIpcGuard()
+    end
+end
+
+local function rejectInjectedRequest(filename, reason)
+    os.remove(TARGET_DIR .. filename)
+    addLog('[guard] rejected ' .. filename)
+    writeLuaEventLog('IPC 请求被拒绝', filename, reason or 'guard 校验失败')
+end
+
+local function validateIpcGuard(req, filename)
+    ensureIpcGuard()
+    if not req or req.guard ~= ipcGuardToken then
+        rejectInjectedRequest(filename, '缺少或错误的安全令牌')
+        return false
+    end
+    rotateIpcGuard()
+    return true
+end
+
+local function commandTouchesProtectedIpc(cmd)
+    if not cmd then return false end
+    local lower = string.lower(cmd)
+    local protected = {
+        'cmd_request.json', 'cmd_result.json',
+        'screenshot_request.json', 'screenshot_result.json',
+        'performance_request.json', 'performance_result.json',
+        'bridge_state.json', 'ipc_guard.json',
+        'screenshot_history.json', 'screenshot_preview_state.json',
+        '/data/quickapp/files/com.shell.liangyi',
+        '/data//files//com.shell.liangyi',
+        'internal://files/',
+        'com.shell.liangyi'
+    }
+    for i = 1, #protected do
+        if string.find(lower, protected[i], 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function commandLooksLikeNestedScript(cmd)
+    if not cmd then return false end
+    local lower = string.lower(cmd)
+    local trimmed = string.gsub(lower, '^%s+', '')
+    local prefixes = {
+        'sh ', '/bin/sh', 'bash ', '/bin/bash', 'busybox sh',
+        'lua ', 'python ', 'python3 ', 'node ', 'perl ', 'ruby ', 'php ',
+        'nohup ', 'setsid '
+    }
+    for i = 1, #prefixes do
+        if string.sub(trimmed, 1, #prefixes[i]) == prefixes[i] then
+            return true
+        end
+    end
+    if string.find(trimmed, '&', 1, true) then
+        return true
+    end
+    return false
+end
+
 -- ====== 命令执行 ======
 
 local function executeShellCommand(cmd)
     if not cmd or cmd == '' then
         return { stdout = '', stderr = '', exitcode = -1 }
+    end
+    if commandTouchesProtectedIpc(cmd) then
+        writeLuaEventLog('命令被拦截', cmd, '命令包含 Shell++ IPC 受保护路径或文件名')
+        return { stdout = '', stderr = 'Blocked: command touches protected Shell++ IPC files', exitcode = -2 }
+    end
+    if commandLooksLikeNestedScript(cmd) then
+        writeLuaEventLog('命令被拦截', cmd, '命令疑似脚本套娃或后台驻留')
+        return { stdout = '', stderr = 'Blocked: nested scripts and background commands are not allowed', exitcode = -3 }
     end
 
     local ts = os.date('%H:%M:%S')
@@ -793,7 +896,7 @@ local function appendLuaLogEntry(title, summary, message)
     return true
 end
 
-local function writeLuaEventLog(title, summary, message)
+writeLuaEventLog = function(title, summary, message)
     pcall(function()
         appendLuaLogEntry(title, summary, message)
     end)
@@ -1009,6 +1112,7 @@ end
 -- ====== 读取命令请求 ======
 
 local lastParseError = 0
+local isPerformanceModeEnabled, applyPerformanceMode
 
 local function readCommandRequest()
     local reqFile = TARGET_DIR .. 'cmd_request.json'
@@ -1039,6 +1143,9 @@ local function readCommandRequest()
     if not json.seq or not json.cmd then
         return nil
     end
+    if not validateIpcGuard(json, 'cmd_request.json') then
+        return nil
+    end
     return { seq = json.seq, cmd = json.cmd, type = json.type or 'cmd' }
 end
 
@@ -1062,9 +1169,43 @@ local function readScreenshotRequest()
     if not json.seq then
         return nil
     end
+    if not validateIpcGuard(json, 'screenshot_request.json') then
+        return nil
+    end
     return {
         seq = json.seq,
         type = 'screenshot',
+        timestamp = json.timestamp
+    }
+end
+
+local function readPerformanceRequest()
+    local reqFile = TARGET_DIR .. 'performance_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            return nil
+        end
+    end
+    if not json.seq then
+        return nil
+    end
+    if not validateIpcGuard(json, 'performance_request.json') then
+        return nil
+    end
+    return {
+        seq = json.seq,
+        type = 'performance',
+        action = json.action or 'status',
         timestamp = json.timestamp
     }
 end
@@ -1079,6 +1220,19 @@ local function writeCommandResult(req, result)
     }
     atomicWrite('cmd_result.json', res)
     os.remove(TARGET_DIR .. 'cmd_request.json')
+end
+
+local function writePerformanceResult(req, status, enabled, message)
+    atomicWrite('performance_result.json', {
+        type = 'performance_result',
+        seq = req.seq,
+        action = req.action or 'status',
+        status = status or 'ok',
+        enabled = enabled == true,
+        message = message or '',
+        timestamp = os.date('%H:%M:%S')
+    })
+    os.remove(TARGET_DIR .. 'performance_request.json')
 end
 
 local function finishScreenshotError(message)
@@ -1208,6 +1362,29 @@ local function checkScreenshotRequest()
     prepareScreenshotRequest(req)
 end
 
+local function checkPerformanceRequest()
+    if cmdBusy then return end
+    if not isRunning then return end
+
+    local req = readPerformanceRequest()
+    if not req then return end
+
+    if req.action == 'enable' then
+        cmdBusy = true
+        busyMode = 'performance'
+        writeBridgeState(true, 'performance', '正在启用性能模式')
+        local ok = applyPerformanceMode()
+        writePerformanceResult(req, ok and 'ok' or 'error', ok, ok and '已启用' or '启用失败')
+        writeLuaEventLog('性能模式', ok and '已启用' or '启用失败', '序号: ' .. tostring(req.seq or -1))
+        cmdBusy = false
+        busyMode = ''
+        writeBridgeState(false, '', '')
+        return
+    end
+
+    writePerformanceResult(req, 'ok', isPerformanceModeEnabled(), '')
+end
+
 local function checkCommandRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -1265,6 +1442,7 @@ local function startService()
     os.execute('mkdir -p ' .. TARGET_DIR)
     os.execute('mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
+    rotateIpcGuard()
     addLog('>>> Service Started')
     writeLuaEventLog('服务启动', 'Terminal Bridge 已启动',
         '设备代号: ' .. activeDeviceProduct
@@ -1276,6 +1454,7 @@ local function startService()
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
             if isRunning then
+                checkPerformanceRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
             end
@@ -1318,7 +1497,21 @@ local function clearLog()
     refreshTerminal()
 end
 
--- ====== 页面构建（单文件双页面，切页用 root:clean() 重建）======
+
+isPerformanceModeEnabled = function()
+    return dirExists('/dev/gameTurbo/')
+end
+
+applyPerformanceMode = function()
+    os.execute('mkdir -p /dev/gameTurbo')
+    os.execute('pmconfig stay normal')
+    os.execute('setlogmask r')
+    os.execute('rm -rf /data/log/ /data/offlinelog/ 2>/dev/null')
+    os.execute('memdump off')
+    return isPerformanceModeEnabled()
+end
+
+-- ====== 页面构建（单文件多页面，切页用 root:clean() 重建）======
 
 -- home：表盘页。上半屏居中显示时间；下半屏居中随机一只动态精灵，点击进入 shell
 buildHomePage = function()
@@ -1506,6 +1699,7 @@ do
 end
 
 buildHomePage()
+startService()
 
 function ScreenStateChangedCB(pre, now, reason)
     if pre ~= 'ON' and now == 'ON' and currentPage == 'home' then
