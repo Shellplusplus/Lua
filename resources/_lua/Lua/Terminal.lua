@@ -247,6 +247,8 @@ local function setTargetDir(path)
 end
 
 local function mkdir(path)
+    if not path or path == '' then return end
+    if path:find('[;&|`]') or path:find('%$') or path:find('[()]') then return end
     os.execute('mkdir -p "' .. path .. '"')
 end
 
@@ -508,7 +510,7 @@ local function atomicWrite(filename, data)
     local tmp = TARGET_DIR .. '.' .. filename .. '.tmp'
     local path = TARGET_DIR .. filename
 
-    os.execute('mkdir -p ' .. TARGET_DIR)
+    os.execute('mkdir -p "' .. TARGET_DIR .. '"')
     local ok = writeFile(tmp, json)
     if not ok then return false end
     os.remove(path)
@@ -520,7 +522,7 @@ local function atomicWriteJson(filename, data)
     local json = jsonEncode(data)
     local tmp = TARGET_DIR .. '.' .. filename .. '.tmp'
     local path = TARGET_DIR .. filename
-    os.execute('mkdir -p ' .. TARGET_DIR)
+    os.execute('mkdir -p "' .. TARGET_DIR .. '"')
     local ok = writeFile(tmp, json)
     if not ok then return false end
     os.remove(path)
@@ -538,12 +540,30 @@ local function writeBridgeState(busy, mode, message)
     })
 end
 
+local function randomHex(n)
+    local f = io.open('/dev/urandom', 'rb')
+    if f then
+        local bytes = f:read(n)
+        f:close()
+        if bytes and #bytes == n then
+            local hex = ''
+            for i = 1, n do
+                hex = hex .. string.format('%02x', string.byte(bytes, i))
+            end
+            return hex
+        end
+    end
+    local r = ''
+    for _ = 1, n do
+        r = r .. string.format('%02x', math.random(0, 255))
+    end
+    return r
+end
+
 local function buildIpcGuardToken()
     local t = tostring(os.time())
-    local c = tostring(os.clock() or 0)
-    local r1 = tostring(math.random(100000, 999999))
-    local r2 = tostring(math.random(100000, 999999))
-    return t .. '-' .. c .. '-' .. r1 .. '-' .. r2
+    local r = randomHex(8)
+    return t .. '-' .. r
 end
 
 local function rotateIpcGuard()
@@ -598,22 +618,36 @@ local function commandTouchesProtectedIpc(cmd)
             return true
         end
     end
+    if string.find(cmd, '%.%./') or string.find(cmd, '%.%..*[/\\]') then
+        return true
+    end
     return false
 end
 
 local function commandLooksLikeNestedScript(cmd)
     if not cmd then return false end
+    if string.find(cmd, '\n', 1, true) or string.find(cmd, '\r', 1, true) then
+        return true
+    end
     local lower = string.lower(cmd)
     local trimmed = string.gsub(lower, '^%s+', '')
     local prefixes = {
-        'sh ', '/bin/sh', 'bash ', '/bin/bash', 'busybox sh',
-        'lua ', 'python ', 'python3 ', 'node ', 'perl ', 'ruby ', 'php ',
-        'nohup ', 'setsid '
+        'sh ', 'sh\t', '/bin/sh', 'bash ', 'bash\t', '/bin/bash', 'busybox sh',
+        'lua ', 'lua\t', '/usr/bin/lua', 'luac ', 'python ', 'python\t', '/usr/bin/python',
+        'python3 ', '/usr/bin/python3', 'node ', 'node\t', '/usr/bin/node',
+        'perl ', 'perl\t', '/usr/bin/perl', 'ruby ', 'ruby\t', '/usr/bin/ruby',
+        'php ', 'php\t', '/usr/bin/php',
+        'nohup ', 'nohup\t', 'setsid ', 'setsid\t',
+        'eval ', 'eval\t', 'exec ', 'exec\t',
+        'source ', 'source\t', '. '
     }
     for i = 1, #prefixes do
         if string.sub(trimmed, 1, #prefixes[i]) == prefixes[i] then
             return true
         end
+    end
+    if string.sub(trimmed, 1, 2) == './' then
+        return true
     end
     if string.find(trimmed, '&', 1, true) then
         return true
@@ -1439,7 +1473,7 @@ local function startService()
         return
     end
     isRunning = true; cmdBusy = false; busyMode = ''
-    os.execute('mkdir -p ' .. TARGET_DIR)
+    os.execute('mkdir -p "' .. TARGET_DIR .. '"')
     os.execute('mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
     rotateIpcGuard()
