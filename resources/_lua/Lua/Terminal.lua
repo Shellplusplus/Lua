@@ -14,8 +14,6 @@ local FB_PATH = '/dev/fb0'
 local SCREENSHOT_DIR = TARGET_DIR .. 'screenshots/'
 local SCREENSHOT_REQ_TIMEOUT = 30
 local SCREENSHOT_HISTORY_LIMIT = 20
-local SCREENSHOT_MIN_DELAY = 5
-local SCREENSHOT_MAX_DELAY = 30
 local LOG_HISTORY_LIMIT = 30
 local TMP_RAW = '/tmp/shell_screenshot.raw'
 local STRIDE_BYTES = SCREEN_W * 3
@@ -699,17 +697,6 @@ local function writeScreenshotResult(data)
     atomicWrite('screenshot_result.json', data)
 end
 
-local function clampScreenshotDelay(value)
-    local delay = tonumber(value) or SCREENSHOT_MIN_DELAY
-    if delay < SCREENSHOT_MIN_DELAY then delay = SCREENSHOT_MIN_DELAY end
-    if delay > SCREENSHOT_MAX_DELAY then delay = SCREENSHOT_MAX_DELAY end
-    return math.floor(delay)
-end
-
-local function getScreenshotDelay(req)
-    return clampScreenshotDelay(req and req.delaySeconds)
-end
-
 local function notifyScreenshotSuccess()
     pcall(function()
         if vibrator and type(vibrator.start) == 'function' and vibrator.type and vibrator.type.SUCCESS then
@@ -1229,10 +1216,7 @@ local function readScreenshotRequest()
     return {
         seq = json.seq,
         type = 'screenshot',
-        timestamp = json.timestamp,
-        captureMode = json.captureMode or (json.requireScreenWake == false and 'delay' or 'screen_wake'),
-        requireScreenWake = json.requireScreenWake ~= false,
-        delaySeconds = clampScreenshotDelay(json.delaySeconds)
+        timestamp = json.timestamp
     }
 end
 
@@ -1303,55 +1287,25 @@ local function finishScreenshotSuccess(item)
     busyMode = ''
 end
 
-local function captureAfterDelay(req, message)
-    local delay = getScreenshotDelay(req)
-    screenshotPhase = 'capturing'
-    writeBridgeState(true, 'screenshot', message or ('将在 ' .. tostring(delay) .. ' 秒后截图'))
-    writeScreenshotResult({
-        type = 'screenshot_result',
-        seq = req and req.seq or -1,
-        status = 'capturing',
-        message = message or ('将在 ' .. tostring(delay) .. ' 秒后截图'),
-        timestamp = os.date('%H:%M:%S')
-    })
-    os.execute('sleep ' .. tostring(delay))
-    local item, err = captureScreenshot(req or { seq = -1 })
-    if item then
-        addLog('[shot] saved #' .. tostring(item.index))
-        finishScreenshotSuccess(item)
-    else
-        addLog('[shot] failed: ' .. tostring(err))
-        finishScreenshotError(err or '截图失败')
-    end
-end
-
 local function prepareScreenshotRequest(req)
     screenshotPending = true
     screenshotReq = req
     screenshotWaitStartedAt = os.time()
-    local captureMode = req.captureMode or (req.requireScreenWake and 'screen_wake' or 'delay')
-    screenshotPhase = captureMode == 'screen_wake' and 'waiting_screen_on' or 'waiting_delay'
+    screenshotPhase = 'waiting_screen_on'
     cmdBusy = true
     busyMode = 'screenshot'
-    local delay = getScreenshotDelay(req)
-    local message = captureMode == 'screen_wake' and '请熄屏后重新亮屏' or ('将在 ' .. tostring(delay) .. ' 秒后截图')
+    local message = '请熄屏后重新亮屏'
     writeBridgeState(true, 'screenshot', message)
     writeScreenshotResult({
         type = 'screenshot_result',
         seq = req.seq,
-        status = captureMode == 'screen_wake' and 'waiting_screen_on' or 'capturing',
+        status = 'waiting_screen_on',
         message = message,
         timestamp = os.date('%H:%M:%S')
     })
     os.remove(TARGET_DIR .. 'screenshot_request.json')
-    if captureMode == 'screen_wake' then
-        addLog('[shot] waiting for screen on')
-        writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n延迟: ' .. tostring(delay) .. '秒\n状态: 请熄屏后重新亮屏')
-    else
-        addLog('[shot] delayed capture in ' .. tostring(delay) .. 's')
-        writeLuaEventLog('截图请求', '延迟截图', '序号: ' .. tostring(req.seq or -1) .. '\n延迟: ' .. tostring(delay) .. '秒')
-        captureAfterDelay(req, message)
-    end
+    addLog('[shot] waiting for screen on')
+    writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n状态: 请熄屏后重新亮屏')
 end
 
 -- ====== 看门狗：检测命令超时 ======
@@ -1719,7 +1673,13 @@ function ScreenStateChangedCB(pre, now, reason)
         return
     end
     if pre ~= 'ON' and now == 'ON' then
-        local delay = getScreenshotDelay(screenshotReq)
-        captureAfterDelay(screenshotReq or { seq = -1 }, '亮屏成功，将在 ' .. tostring(delay) .. ' 秒后截图')
+        local item, err = captureScreenshot(screenshotReq or { seq = -1 })
+        if item then
+            addLog('[shot] saved #' .. tostring(item.index))
+            finishScreenshotSuccess(item)
+        else
+            addLog('[shot] failed: ' .. tostring(err))
+            finishScreenshotError(err or '截图失败')
+        end
     end
 end
