@@ -1,6 +1,6 @@
 -- Terminal.lua
 -- Shell 终端桥接表盘
--- 接收快应用的命令/截图/性能模式请求 → 执行后写回结果
+-- 接收快应用的命令/截图请求 → 执行后写回结果
 
 local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local BAND10_PRO_DIR = '/data//files//com.shell.liangyi/'
@@ -607,7 +607,6 @@ local function commandTouchesProtectedIpc(cmd)
     local protected = {
         'cmd_request.json', 'cmd_result.json',
         'screenshot_request.json', 'screenshot_result.json',
-        'performance_request.json', 'performance_result.json',
         'bridge_state.json', 'ipc_guard.json',
         'screenshot_history.json', 'screenshot_preview_state.json',
         'screenshot_settings.json',
@@ -1168,7 +1167,6 @@ end
 -- ====== 读取命令请求 ======
 
 local lastParseError = 0
-local isPerformanceModeEnabled, applyPerformanceMode
 
 local function readCommandRequest()
     local reqFile = TARGET_DIR .. 'cmd_request.json'
@@ -1238,37 +1236,6 @@ local function readScreenshotRequest()
     }
 end
 
-local function readPerformanceRequest()
-    local reqFile = TARGET_DIR .. 'performance_request.json'
-    if not fileExists(reqFile) then return nil end
-
-    local content = readFile(reqFile)
-    if not content or content == '' then return nil end
-
-    local json = jsonDecode(content)
-    if not json then
-        os.execute('sleep 0.1')
-        content = readFile(reqFile)
-        if not content or content == '' then return nil end
-        json = jsonDecode(content)
-        if not json then
-            return nil
-        end
-    end
-    if not json.seq then
-        return nil
-    end
-    if not validateIpcGuard(json, 'performance_request.json') then
-        return nil
-    end
-    return {
-        seq = json.seq,
-        type = 'performance',
-        action = json.action or 'status',
-        timestamp = json.timestamp
-    }
-end
-
 -- ====== 写入命令结果 ======
 
 local function writeCommandResult(req, result)
@@ -1279,19 +1246,6 @@ local function writeCommandResult(req, result)
     }
     atomicWrite('cmd_result.json', res)
     os.remove(TARGET_DIR .. 'cmd_request.json')
-end
-
-local function writePerformanceResult(req, status, enabled, message)
-    atomicWrite('performance_result.json', {
-        type = 'performance_result',
-        seq = req.seq,
-        action = req.action or 'status',
-        status = status or 'ok',
-        enabled = enabled == true,
-        message = message or '',
-        timestamp = os.date('%H:%M:%S')
-    })
-    os.remove(TARGET_DIR .. 'performance_request.json')
 end
 
 local function finishScreenshotError(message)
@@ -1453,29 +1407,6 @@ local function checkScreenshotRequest()
     prepareScreenshotRequest(req)
 end
 
-local function checkPerformanceRequest()
-    if cmdBusy then return end
-    if not isRunning then return end
-
-    local req = readPerformanceRequest()
-    if not req then return end
-
-    if req.action == 'enable' then
-        cmdBusy = true
-        busyMode = 'performance'
-        writeBridgeState(true, 'performance', '正在启用性能模式')
-        local ok = applyPerformanceMode()
-        writePerformanceResult(req, ok and 'ok' or 'error', ok, ok and '已启用' or '启用失败')
-        writeLuaEventLog('性能模式', ok and '已启用' or '启用失败', '序号: ' .. tostring(req.seq or -1))
-        cmdBusy = false
-        busyMode = ''
-        writeBridgeState(false, '', '')
-        return
-    end
-
-    writePerformanceResult(req, 'ok', isPerformanceModeEnabled(), '')
-end
-
 local function checkCommandRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -1545,7 +1476,6 @@ local function startService()
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
             if isRunning then
-                checkPerformanceRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
             end
@@ -1588,19 +1518,6 @@ local function clearLog()
     refreshTerminal()
 end
 
-
-isPerformanceModeEnabled = function()
-    return dirExists('/dev/gameTurbo/')
-end
-
-applyPerformanceMode = function()
-    os.execute('mkdir -p /dev/gameTurbo')
-    os.execute('pmconfig stay normal')
-    os.execute('setlogmask r')
-    os.execute('rm -rf /data/log/ /data/offlinelog/ 2>/dev/null')
-    os.execute('memdump off')
-    return isPerformanceModeEnabled()
-end
 
 -- ====== 页面构建（单文件多页面，切页用 root:clean() 重建）======
 
