@@ -1,6 +1,6 @@
 -- Terminal.lua
 -- Shell 终端桥接表盘
--- 接收快应用的命令/截图请求 → 执行后写回结果
+-- 接收快应用的命令/截图/文件请求 → 执行后写回结果
 
 local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local BAND10_PRO_DIR = '/data//files//com.shell.liangyi/'
@@ -605,6 +605,7 @@ local function commandTouchesProtectedIpc(cmd)
     local protected = {
         'cmd_request.json', 'cmd_result.json',
         'screenshot_request.json', 'screenshot_result.json',
+        'file_request.json', 'file_result.json',
         'bridge_state.json', 'ipc_guard.json',
         'screenshot_history.json', 'screenshot_preview_state.json',
         'screenshot_settings.json',
@@ -1220,6 +1221,43 @@ local function readScreenshotRequest()
     }
 end
 
+local function readFileRequest()
+    local reqFile = TARGET_DIR .. 'file_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            return nil
+        end
+    end
+    if not json.seq or not json.action then
+        return nil
+    end
+    if not validateIpcGuard(json, 'file_request.json') then
+        return nil
+    end
+    return {
+        seq = json.seq,
+        type = 'file',
+        action = json.action,
+        path = json.path or '/',
+        dest = json.dest or '',
+        content = json.content or '',
+        offset = tonumber(json.offset) or 0,
+        length = tonumber(json.length) or 128,
+        limit = tonumber(json.limit) or 4096,
+        timestamp = json.timestamp
+    }
+end
+
 -- ====== 写入命令结果 ======
 
 local function writeCommandResult(req, result)
@@ -1230,6 +1268,16 @@ local function writeCommandResult(req, result)
     }
     atomicWrite('cmd_result.json', res)
     os.remove(TARGET_DIR .. 'cmd_request.json')
+end
+
+local function writeFileResult(req, result)
+    result = result or {}
+    result.type = 'file_result'
+    result.seq = req and req.seq or -1
+    result.action = req and req.action or ''
+    result.timestamp = os.date('%H:%M:%S')
+    atomicWrite('file_result.json', result)
+    os.remove(TARGET_DIR .. 'file_request.json')
 end
 
 local function finishScreenshotError(message)
@@ -1308,6 +1356,217 @@ local function prepareScreenshotRequest(req)
     writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n状态: 请熄屏后重新亮屏')
 end
 
+local function normalizeFileManagerPath(path)
+    path = tostring(path or '/')
+    if path == '' then path = '/' end
+    if string.sub(path, 1, 1) ~= '/' then path = '/' .. path end
+    return path
+end
+
+local function basename(path)
+    path = tostring(path or '')
+    if path ~= '/' and string.sub(path, -1) == '/' then
+        path = string.sub(path, 1, -2)
+    end
+    local name = string.match(path, '([^/]+)$')
+    return name or path
+end
+
+local function joinFilePath(base, name)
+    base = normalizeFileManagerPath(base)
+    name = tostring(name or '')
+    if base == '/' then return '/' .. name end
+    if string.sub(base, -1) == '/' then return base .. name end
+    return base .. '/' .. name
+end
+
+local function fileManagerSize(path)
+    local ok, size = pcall(function()
+        local f = lvgl.fs.open_file(path, 'r')
+        if not f then return nil end
+        local len = f:seek('end')
+        f:close()
+        return len
+    end)
+    if ok and size then return tostring(size) end
+    return '-'
+end
+
+local function fileManagerList(path)
+    path = normalizeFileManagerPath(path)
+    local dir, msg = lvgl.fs.open_dir(path)
+    if not dir then
+        return { status = 'error', message = tostring(msg or 'open dir failed'), path = path, items = {} }
+    end
+    local items = {}
+    while true do
+        local entry = dir:read()
+        if not entry then break end
+        local isDir = string.byte(entry, 1) == string.byte('/', 1)
+        local name = isDir and string.sub(entry, 2) or entry
+        local fullPath
+        if isDir then
+            fullPath = path == '/' and entry or (path .. entry)
+        else
+            fullPath = joinFilePath(path, entry)
+        end
+        items[#items + 1] = {
+            name = name,
+            path = fullPath,
+            isDir = isDir,
+            size = isDir and '-' or fileManagerSize(fullPath)
+        }
+    end
+    dir:close()
+    table.sort(items, function(a, b)
+        if a.isDir ~= b.isDir then return a.isDir end
+        return tostring(a.name) < tostring(b.name)
+    end)
+    return { status = 'ok', path = path, items = items }
+end
+
+local function fileManagerInfo(path)
+    path = normalizeFileManagerPath(path)
+    return { status = 'ok', path = path, name = basename(path), size = fileManagerSize(path) }
+end
+
+local function sanitizeFileText(text)
+    text = tostring(text or '')
+    local out = {}
+    for i = 1, #text do
+        local byte = string.byte(text, i)
+        if byte == 9 or byte == 10 or byte == 13 or byte >= 32 then
+            out[#out + 1] = string.char(byte)
+        else
+            out[#out + 1] = '.'
+        end
+    end
+    return table.concat(out)
+end
+
+local function fileManagerText(path, limit)
+    path = normalizeFileManagerPath(path)
+    limit = tonumber(limit) or 4096
+    if limit < 512 then limit = 512 end
+    if limit > 16384 then limit = 16384 end
+    local ok, content = pcall(function()
+        local f = lvgl.fs.open_file(path, 'r')
+        if not f then return nil end
+        local text = f:read(limit)
+        f:close()
+        return text or ''
+    end)
+    if not ok or content == nil then
+        return { status = 'error', message = 'read failed', path = path, content = '' }
+    end
+    return { status = 'ok', path = path, content = sanitizeFileText(content) }
+end
+
+local function fileManagerHex(path, offset, length)
+    path = normalizeFileManagerPath(path)
+    offset = tonumber(offset) or 0
+    length = tonumber(length) or 128
+    if offset < 0 then offset = 0 end
+    if length < 16 then length = 16 end
+    if length > 512 then length = 512 end
+    local ok, content = pcall(function()
+        local f = lvgl.fs.open_file(path, 'r')
+        if not f then return nil end
+        f:seek('set', offset)
+        local bytes = f:read(length) or ''
+        f:close()
+        local lines = {}
+        local line = string.format('%08X  ', offset)
+        for i = 1, #bytes do
+            line = line .. string.format('%02X ', string.byte(bytes, i))
+            if i % 8 == 0 then
+                lines[#lines + 1] = line
+                line = string.format('%08X  ', offset + i)
+            end
+        end
+        if #bytes % 8 ~= 0 or #bytes == 0 then
+            lines[#lines + 1] = line
+        end
+        return table.concat(lines, '\n')
+    end)
+    if not ok or content == nil then
+        return { status = 'error', message = 'hex read failed', path = path, content = '' }
+    end
+    return { status = 'ok', path = path, content = content, offset = offset }
+end
+
+local function fileManagerWrite(req)
+    local path = normalizeFileManagerPath(req.path)
+    local content = tostring(req.content or '')
+    local ok = pcall(function()
+        local f = lvgl.fs.open_file(path, 'w')
+        if not f then error('open failed') end
+        f:write(content)
+        f:close()
+    end)
+    return { status = ok and 'ok' or 'error', message = ok and '保存完成' or '保存失败', path = path, size = tostring(#content) }
+end
+
+local function copyFileRaw(src, dst)
+    local input = lvgl.fs.open_file(src, 'r')
+    if not input then return false end
+    local output = lvgl.fs.open_file(dst, 'w')
+    if not output then input:close(); return false end
+    while true do
+        local chunk = input:read(4096)
+        if not chunk or chunk == '' then break end
+        output:write(chunk)
+        if #chunk < 4096 then break end
+    end
+    input:close()
+    output:close()
+    return true
+end
+
+local function fileManagerCopy(req)
+    local src = normalizeFileManagerPath(req.path)
+    local dst = joinFilePath(req.dest ~= '' and req.dest or '/', basename(src))
+    local ok = copyFileRaw(src, dst)
+    return { status = ok and 'ok' or 'error', message = ok and '复制完成' or '复制失败', path = src, dest = dst }
+end
+
+local function fileManagerMove(req)
+    local src = normalizeFileManagerPath(req.path)
+    local dst = joinFilePath(req.dest ~= '' and req.dest or '/', basename(src))
+    local ok = false
+    if os and type(os.rename) == 'function' then
+        local safe, renamed = pcall(os.rename, src, dst)
+        ok = safe and renamed == true
+    end
+    if not ok then
+        ok = copyFileRaw(src, dst)
+        if ok and os and type(os.remove) == 'function' then pcall(os.remove, src) end
+    end
+    return { status = ok and 'ok' or 'error', message = ok and '移动完成' or '移动失败', path = src, dest = dst }
+end
+
+local function fileManagerDelete(req)
+    local path = normalizeFileManagerPath(req.path)
+    local ok = false
+    if os and type(os.remove) == 'function' then
+        local safe, removed = pcall(os.remove, path)
+        ok = safe and removed == true
+    end
+    return { status = ok and 'ok' or 'error', message = ok and '删除完成' or '删除失败', path = path }
+end
+
+local function executeFileRequest(req)
+    if req.action == 'list' then return fileManagerList(req.path) end
+    if req.action == 'info' then return fileManagerInfo(req.path) end
+    if req.action == 'text' then return fileManagerText(req.path, req.limit) end
+    if req.action == 'write' then return fileManagerWrite(req) end
+    if req.action == 'hex' then return fileManagerHex(req.path, req.offset, req.length) end
+    if req.action == 'copy' then return fileManagerCopy(req) end
+    if req.action == 'move' then return fileManagerMove(req) end
+    if req.action == 'delete' then return fileManagerDelete(req) end
+    return { status = 'error', message = '未知文件操作' }
+end
+
 -- ====== 看门狗：检测命令超时 ======
 
 local function watchdogCheck()
@@ -1359,6 +1618,29 @@ local function checkScreenshotRequest()
     local req = readScreenshotRequest()
     if not req then return end
     prepareScreenshotRequest(req)
+end
+
+local function checkFileRequest()
+    if cmdBusy then return end
+    if not isRunning then return end
+
+    local req = readFileRequest()
+    if not req then return end
+
+    cmdBusy = true
+    busyMode = 'file'
+    writeBridgeState(true, 'file', '文件操作中')
+    local result = executeFileRequest(req)
+    writeFileResult(req, result)
+    writeLuaEventLog('文件管理', req.action or '',
+        '序号: ' .. tostring(req.seq or -1)
+        .. '\n操作: ' .. tostring(req.action or '')
+        .. '\n路径: ' .. tostring(req.path or '')
+        .. '\n目标: ' .. tostring(req.dest or '')
+        .. '\n状态: ' .. tostring(result and result.status or '-'))
+    cmdBusy = false
+    busyMode = ''
+    writeBridgeState(false, '', '')
 end
 
 local function checkCommandRequest()
@@ -1430,6 +1712,7 @@ local function startService()
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
             if isRunning then
+                checkFileRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
             end
