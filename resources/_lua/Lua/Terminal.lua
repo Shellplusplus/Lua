@@ -248,8 +248,8 @@ end
 
 local function mkdir(path)
     if not path or path == '' then return end
-    if path:find('[;&|`]') or path:find('%$') or path:find('[()]') then return end
-    os.execute('mkdir -p "' .. path .. '"')
+    if path:find('[;&|`"\\]') or path:find('%$') or path:find('[()]') then return end
+    pcall(os.execute, 'mkdir -p "' .. path .. '"')
 end
 
 local function readAll(path, maxLen)
@@ -510,11 +510,11 @@ local function atomicWrite(filename, data)
     local tmp = TARGET_DIR .. '.' .. filename .. '.tmp'
     local path = TARGET_DIR .. filename
 
-    os.execute('mkdir -p "' .. TARGET_DIR .. '"')
+    pcall(os.execute, 'mkdir -p "' .. TARGET_DIR .. '"')
     local ok = writeFile(tmp, json)
     if not ok then return false end
     os.remove(path)
-    os.execute('mv "' .. tmp .. '" "' .. path .. '"')
+    pcall(os.execute, 'mv "' .. tmp .. '" "' .. path .. '"')
     return true
 end
 
@@ -522,11 +522,11 @@ local function atomicWriteJson(filename, data)
     local json = jsonEncode(data)
     local tmp = TARGET_DIR .. '.' .. filename .. '.tmp'
     local path = TARGET_DIR .. filename
-    os.execute('mkdir -p "' .. TARGET_DIR .. '"')
+    pcall(os.execute, 'mkdir -p "' .. TARGET_DIR .. '"')
     local ok = writeFile(tmp, json)
     if not ok then return false end
     os.remove(path)
-    os.execute('mv "' .. tmp .. '" "' .. path .. '"')
+    pcall(os.execute, 'mv "' .. tmp .. '" "' .. path .. '"')
     return true
 end
 
@@ -1698,8 +1698,8 @@ local function startService()
         return
     end
     isRunning = true; cmdBusy = false; busyMode = ''
-    os.execute('mkdir -p "' .. TARGET_DIR .. '"')
-    os.execute('mkdir -p "' .. SCREENSHOT_DIR .. '"')
+    pcall(os.execute, 'mkdir -p "' .. TARGET_DIR .. '"')
+    pcall(os.execute, 'mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
     rotateIpcGuard()
     addLog('>>> Service Started')
