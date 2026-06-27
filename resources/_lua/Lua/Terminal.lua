@@ -1398,14 +1398,14 @@ end
 
 local function fileManagerList(path)
     path = normalizeFileManagerPath(path)
-    local dir, msg = lvgl.fs.open_dir(path)
-    if not dir then
+    local ok, dir, msg = pcall(lvgl.fs.open_dir, path)
+    if not ok or not dir then
         return { status = 'error', message = tostring(msg or 'open dir failed'), path = path, items = {} }
     end
     local items = {}
     while true do
-        local entry = dir:read()
-        if not entry then break end
+        local readOk, entry = pcall(dir.read, dir)
+        if not readOk or not entry then break end
         local isDir = string.byte(entry, 1) == string.byte('/', 1)
         local name = isDir and string.sub(entry, 2) or entry
         local fullPath
@@ -1421,7 +1421,7 @@ local function fileManagerList(path)
             size = isDir and '-' or fileManagerSize(fullPath)
         }
     end
-    dir:close()
+    pcall(dir.close, dir)
     table.sort(items, function(a, b)
         if a.isDir ~= b.isDir then return a.isDir end
         return tostring(a.name) < tostring(b.name)
@@ -1512,19 +1512,21 @@ local function fileManagerWrite(req)
 end
 
 local function copyFileRaw(src, dst)
-    local input = lvgl.fs.open_file(src, 'r')
-    if not input then return false end
-    local output = lvgl.fs.open_file(dst, 'w')
-    if not output then input:close(); return false end
+    local ok1, input = pcall(lvgl.fs.open_file, src, 'r')
+    if not ok1 or not input then return false end
+    local ok2, output = pcall(lvgl.fs.open_file, dst, 'w')
+    if not ok2 or not output then pcall(input.close, input); return false end
+    local success = true
     while true do
-        local chunk = input:read(4096)
-        if not chunk or chunk == '' then break end
-        output:write(chunk)
+        local readOk, chunk = pcall(input.read, input, 4096)
+        if not readOk or not chunk or chunk == '' then break end
+        local writeOk = pcall(output.write, output, chunk)
+        if not writeOk then success = false; break end
         if #chunk < 4096 then break end
     end
-    input:close()
-    output:close()
-    return true
+    pcall(input.close, input)
+    pcall(output.close, output)
+    return success
 end
 
 local function fileManagerCopy(req)
