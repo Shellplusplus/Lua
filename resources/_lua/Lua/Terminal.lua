@@ -610,7 +610,7 @@ local function commandTouchesProtectedIpc(cmd)
         'screenshot_history.json', 'screenshot_preview_state.json',
         'screenshot_settings.json',
         '/data/quickapp/files/com.shell.liangyi',
-        '/data//files//com.shell.liangyi',
+        '/data/data/com.shell.liangyi',
         'internal://files/',
         'com.shell.liangyi'
     }
@@ -651,6 +651,9 @@ local function commandLooksLikeNestedScript(cmd)
         return true
     end
     if string.find(trimmed, '&', 1, true) then
+        return true
+    end
+    if string.find(cmd, '[|;`]') or string.find(cmd, '%$%(') then
         return true
     end
     return false
