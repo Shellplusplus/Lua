@@ -253,8 +253,8 @@ local function mkdir(path)
 end
 
 local function readAll(path, maxLen)
-    local f = io.open(path, 'r')
-    if not f then return '' end
+    local ok, f = pcall(io.open, path, 'r')
+    if not ok or not f then return '' end
     local text = ''
     for line in f:lines() do
         text = text .. line .. '\n'
