@@ -4,6 +4,7 @@
 
 local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
 local BAND10_PRO_DIR = '/data/data/com.shell.liangyi/'
+local BAND10_PRO_FILES_DIR = '/data/files/com.shell.liangyi/'
 local DEVICE_INFO_FILE = 'device_info.json'
 local SCREENSHOT_DEBUG_FILE = 'screenshot_debug.json'
 local TARGET_DIR = BAND10_PRO_DIR
@@ -476,38 +477,45 @@ local function readDeviceInfoFrom(dir)
 end
 
 local function resolveTargetDirByDeviceInfo()
-    local candidates = { BAND9_PRO_DIR, BAND10_PRO_DIR }
-    local latest = nil
+    local candidates = {
+        BAND9_PRO_DIR,         -- Band 9 Pro / Watch S4 / Watch S4 41mm
+        BAND10_PRO_DIR,        -- Band 10 Pro
+        BAND10_PRO_FILES_DIR,  -- Band 10 Pro fallback
+    }
+    local selected = nil
 
     for _, dir in ipairs(candidates) do
         local data = readDeviceInfoFrom(dir)
-        if data and (not latest or data._updatedAtUnix >= latest._updatedAtUnix) then
-            latest = data
+        if data then
+            selected = data
+            break
         end
     end
 
-    if not latest then
+    if not selected then
         activeDeviceProduct = '-'
         activeDeviceModel = '-'
         activeDeviceSourceDir = ''
         return false, '请打开快应用获取设备信息后再试'
     end
 
-    local product = tostring(latest.product or '')
-    local chosenDir = latest._sourceDir or BAND10_PRO_DIR
+    local product = tostring(selected.product or '')
+    local chosenDir = selected._sourceDir or BAND10_PRO_DIR
 
     if product == 'Xiaomi Smart Band 9 Pro'
         or product == 'Xiaomi Watch S4'
         or product == 'Xiaomi Watch S4 41mm' then
         chosenDir = BAND9_PRO_DIR
     elseif product == 'Xiaomi Smart Band 10 Pro' then
-        chosenDir = BAND10_PRO_DIR
+        if chosenDir ~= BAND10_PRO_FILES_DIR then
+            chosenDir = BAND10_PRO_DIR
+        end
     end
 
     setTargetDir(chosenDir)
     activeDeviceProduct = product ~= '' and product or '-'
-    activeDeviceModel = tostring(latest.model or '-')
-    activeDeviceSourceDir = tostring(latest._sourceDir or chosenDir)
+    activeDeviceModel = tostring(selected.model or '-')
+    activeDeviceSourceDir = tostring(selected._sourceDir or chosenDir)
     return true
 end
 
