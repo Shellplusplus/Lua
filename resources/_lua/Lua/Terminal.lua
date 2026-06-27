@@ -3,7 +3,7 @@
 -- 接收快应用的命令/截图/文件请求 → 执行后写回结果
 
 local BAND9_PRO_DIR = '/data/quickapp/files/com.shell.liangyi/'
-local BAND10_PRO_DIR = '/data//files//com.shell.liangyi/'
+local BAND10_PRO_DIR = '/data/data/com.shell.liangyi/'
 local DEVICE_INFO_FILE = 'device_info.json'
 local SCREENSHOT_DEBUG_FILE = 'screenshot_debug.json'
 local TARGET_DIR = BAND10_PRO_DIR
