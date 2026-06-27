@@ -277,7 +277,7 @@ end
 local function jsonEncode(val)
     local t = type(val)
     if t == 'string' then
-        return '"' .. val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t') .. '"'
+        return '"' .. val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t'):gsub('[\x00-\x1f]', function(c) return string.format('\\u%04x', string.byte(c)) end) .. '"'
     elseif t == 'number' then
         if val == math.floor(val) then return string.format('%d', val) end
         return string.format('%g', val)
