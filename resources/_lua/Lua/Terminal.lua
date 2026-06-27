@@ -1580,7 +1580,7 @@ local function watchdogCheck()
         return
     end
     if not cmdStartTime then return end
-    local elapsed = (os.clock() or 0) - cmdStartTime
+    local elapsed = os.time() - cmdStartTime
     if elapsed * 1000 < CMD_TIMEOUT then return end
 
     local timedOutCmd = currentCmd
@@ -1655,7 +1655,7 @@ local function checkCommandRequest()
     busyMode = 'cmd'
     currentCmd = req.cmd
     currentReq = req
-    cmdStartTime = os.clock() or 0
+    cmdStartTime = os.time()
     writeBridgeState(true, 'cmd', '命令执行中')
     local result = executeShellCommand(req.cmd)
     writeCommandResult(req, result)
