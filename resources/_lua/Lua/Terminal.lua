@@ -343,6 +343,19 @@ local function jsonDecode(json)
                 elseif esc == 'n'  then parts[#parts+1] = '\n'
                 elseif esc == 'r'  then parts[#parts+1] = '\r'
                 elseif esc == 't'  then parts[#parts+1] = '\t'
+                elseif esc == 'u'  then
+                    local hex = json:sub(pos + 1, pos + 4)
+                    if #hex < 4 then error('incomplete unicode escape') end
+                    local cp = tonumber(hex, 16)
+                    if not cp then error('invalid unicode escape') end
+                    pos = pos + 4
+                    if cp < 0x80 then
+                        parts[#parts+1] = string.char(cp)
+                    elseif cp < 0x800 then
+                        parts[#parts+1] = string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+                    else
+                        parts[#parts+1] = string.char(0xE0 + math.floor(cp / 0x1000), 0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+                    end
                 else error('bad escape: \\' .. esc) end
                 pos = pos + 1
             else
