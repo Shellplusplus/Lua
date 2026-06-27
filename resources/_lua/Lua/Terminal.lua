@@ -675,17 +675,18 @@ local function executeShellCommand(cmd)
     addLog('[' .. ts .. '] Exec: ' .. cmd)
 
     local outFile = '/tmp/shell_stdout.txt'
+    local errFile = '/tmp/shell_stderr.txt'
     os.remove(outFile)
+    os.remove(errFile)
 
-    local fullCmd = cmd .. ' > ' .. outFile
+    local fullCmd = cmd .. ' > ' .. outFile .. ' 2> ' .. errFile
     pcall(os.execute, fullCmd)
 
     local stdout = readAll(outFile, 32768)
+    local stderr = readAll(errFile, 16384)
 
-    -- 有输出 = 命令执行成功
     local exitcode = 0
-    local stderr = ''
-    if stdout == '' then
+    if stdout == '' and stderr == '' then
         exitcode = -1
         stdout = '(no output)'
     end
