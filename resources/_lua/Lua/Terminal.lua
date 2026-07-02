@@ -297,7 +297,6 @@ local function getScreenshotProfile()
             skipRows = 0
             minRows = 512
             readRows = 512
-            candidateSkipRows = { 0, 512 }
         end
     end
 
