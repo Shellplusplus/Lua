@@ -773,14 +773,15 @@ local function executeShellCommand(cmd)
     local ts = os.date('%H:%M:%S')
     addLog('[' .. ts .. '] Exec: ' .. cmd)
 
-    local outFile = '/tmp/shell_stdout.txt'
+    mkdir(TARGET_DIR)
+    local outFile = TARGET_DIR .. '.shell_stdout.txt'
     os.remove(outFile)
 
     -- 这台设备只允许 os.execute：io.popen 被固件禁用，嵌套 spawn nsh 会崩。
     -- NSH 只支持 `>` 重定向 stdout，不支持 `2>`（bash 语法，会导致整行解析
     -- 失败、命令根本不执行）。所以只用 `> outFile` 捕获 stdout；nsh 不支持
     -- 分离 stderr，命令的报错信息通常也会打到 stdout 里。
-    os.execute(cmd .. ' > ' .. outFile)
+    os.execute(cmd .. ' > "' .. outFile .. '"')
     local stdout = readAll(outFile, 32768)
 
     if #stdout > 32768 then
