@@ -292,8 +292,8 @@ local function getScreenshotProfile()
         method = 'stream'
         name = 'redmi_watch6'
         if SCREEN_W == 432 and SCREEN_H == 514 then
-            skipRows = 512
-            minRows = 512
+            skipRows = 0
+            minRows = SCREEN_H
         end
     end
 
