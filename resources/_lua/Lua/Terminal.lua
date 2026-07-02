@@ -18,6 +18,9 @@ local SCREENSHOT_HISTORY_LIMIT = 20
 local LOG_HISTORY_LIMIT = 30
 local TMP_RAW = '/tmp/shell_screenshot.raw'
 local STRIDE_BYTES = SCREEN_W * 3
+local SCREENSHOT_CHUNK_SIZE = 32 * 1024
+local FRAMEBUFFER_OFFSET_BYTES = STRIDE_BYTES * SCREEN_H
+local FRAMEBUFFER_SIZE_BYTES = STRIDE_BYTES * SCREEN_H
 
 
 
@@ -240,6 +243,15 @@ end
 
 local function removeFile(path)
     pcall(os.remove, path)
+end
+
+local function fileSize(path)
+    local ok, f = pcall(io.open, path, 'rb')
+    if not ok or not f then return 0 end
+    local seekOk, size = pcall(f.seek, f, 'end')
+    f:close()
+    if not seekOk then return 0 end
+    return tonumber(size) or 0
 end
 
 local function setTargetDir(path)
@@ -1064,6 +1076,268 @@ local function writePng(path, width, height, rgb888Data)
     return true
 end
 
+local function buildCrcTable()
+    local crcTable = {}
+    for i = 0, 255 do
+        local c = i
+        for _ = 1, 8 do
+            if c % 2 == 1 then
+                c = math.floor(c / 2) ~ 0xEDB88320
+            else
+                c = math.floor(c / 2)
+            end
+        end
+        crcTable[i] = c
+    end
+    return crcTable
+end
+
+local function makePngWriter(path)
+    local fPng = io.open(path, 'wb')
+    if not fPng then
+        return nil
+    end
+
+    local crcTable = buildCrcTable()
+
+    local function writeInt32(n)
+        fPng:write(string.char(
+            (n >> 24) & 0xFF,
+            (n >> 16) & 0xFF,
+            (n >> 8) & 0xFF,
+            n & 0xFF
+        ))
+    end
+
+    local function crcUpdate(crc, data)
+        for i = 1, #data do
+            crc = (crc >> 8) ~ crcTable[(crc ~ string.byte(data, i)) & 0xFF]
+        end
+        return crc
+    end
+
+    local function writeChunk(typeName, length, writeBody)
+        local crc = 0xFFFFFFFF
+        writeInt32(length)
+        fPng:write(typeName)
+        crc = crcUpdate(crc, typeName)
+        local safe, ok, err = pcall(writeBody, function(data)
+            if not data or data == '' then return end
+            fPng:write(data)
+            crc = crcUpdate(crc, data)
+        end)
+        if not safe then
+            return false, tostring(ok)
+        end
+        if not ok then
+            return false, err
+        end
+        writeInt32(crc ~ 0xFFFFFFFF)
+        return true
+    end
+
+    return {
+        file = fPng,
+        writeInt32 = writeInt32,
+        writeChunk = writeChunk,
+        close = function()
+            fPng:close()
+        end
+    }
+end
+
+local function updateAdler32(a, b, data)
+    for i = 1, #data do
+        a = (a + string.byte(data, i)) % 65521
+        b = (b + a) % 65521
+    end
+    return a, b
+end
+
+local function bgrRowToPngScanline(rowData, width)
+    if not rowData or #rowData < width * 3 then
+        return nil
+    end
+    local parts = { '\0' }
+    local out = 2
+    for x = 0, width - 1 do
+        local p = x * 3 + 1
+        local b = string.byte(rowData, p) or 0
+        local g = string.byte(rowData, p + 1) or 0
+        local r = string.byte(rowData, p + 2) or 0
+        parts[out] = string.char(r, g, b)
+        out = out + 1
+    end
+    return table.concat(parts)
+end
+
+local function writePngFromRaw(rawPath, path, width, height)
+    local fRaw = io.open(rawPath, 'rb')
+    if not fRaw then
+        return false, '无法读取截图临时文件'
+    end
+
+    local writer = makePngWriter(path)
+    if not writer then
+        fRaw:close()
+        return false, '无法创建 PNG 文件'
+    end
+
+    local rowLen = width * 3
+    local scanlineLen = rowLen + 1
+    local idatLen = 2 + height * (5 + scanlineLen) + 4
+    local a, b = 1, 0
+    local ok = true
+    local err = nil
+
+    writer.file:write('\137PNG\r\n\026\n')
+    ok, err = writer.writeChunk('IHDR', 13, function(write)
+        write(string.char(
+            (width >> 24) & 0xFF, (width >> 16) & 0xFF, (width >> 8) & 0xFF, width & 0xFF,
+            (height >> 24) & 0xFF, (height >> 16) & 0xFF, (height >> 8) & 0xFF, height & 0xFF,
+            8, 2, 0, 0, 0
+        ))
+        return true
+    end)
+    if not ok then
+        fRaw:close()
+        writer.close()
+        removeFile(path)
+        return false, err or 'PNG 头写入失败'
+    end
+
+    ok, err = writer.writeChunk('IDAT', idatLen, function(write)
+        write('\x78\x01')
+        for y = 0, height - 1 do
+            local row = fRaw:read(rowLen)
+            if not row or #row < rowLen then
+                return false, '截图数据不足'
+            end
+            local scanline = bgrRowToPngScanline(row, width)
+            if not scanline then
+                return false, '像素转换失败'
+            end
+            local final = (y == height - 1) and 1 or 0
+            local l = scanlineLen & 0xFF
+            local h = (scanlineLen >> 8) & 0xFF
+            write(string.char(final, l, h, 255 - l, 255 - h))
+            write(scanline)
+            a, b = updateAdler32(a, b, scanline)
+        end
+        write(string.char(
+            (b >> 8) & 0xFF,
+            b & 0xFF,
+            (a >> 8) & 0xFF,
+            a & 0xFF
+        ))
+        return true
+    end)
+    if not ok then
+        fRaw:close()
+        writer.close()
+        removeFile(path)
+        return false, err or 'PNG 数据写入失败'
+    end
+
+    ok, err = writer.writeChunk('IEND', 0, function()
+        return true
+    end)
+    fRaw:close()
+    writer.close()
+    if not ok then
+        removeFile(path)
+        return false, err or 'PNG 结束块写入失败'
+    end
+    return true
+end
+
+local function copyStream(input, output, totalBytes)
+    local remaining = tonumber(totalBytes) or 0
+    while remaining > 0 do
+        local requestSize = remaining > SCREENSHOT_CHUNK_SIZE and SCREENSHOT_CHUNK_SIZE or remaining
+        local readOk, chunk = pcall(input.read, input, requestSize)
+        if not readOk then
+            return false
+        end
+        if not chunk or chunk == '' then
+            return false
+        end
+        local ok = pcall(output.write, output, chunk)
+        if not ok then
+            return false
+        end
+        remaining = remaining - #chunk
+    end
+    return true
+end
+
+local function copyFileChunked(srcPath, dstPath, totalBytes)
+    removeFile(dstPath)
+    local input = io.open(srcPath, 'rb')
+    local output = io.open(dstPath, 'wb')
+    if not input or not output then
+        if input then input:close() end
+        if output then output:close() end
+        return false
+    end
+    local ok = copyStream(input, output, totalBytes)
+    input:close()
+    output:close()
+    if ok and fileSize(dstPath) >= totalBytes then
+        return true
+    end
+    removeFile(dstPath)
+    return false
+end
+
+local function captureFramebufferToFile(path)
+    removeFile(path)
+    local input = io.open(FB_PATH, 'rb')
+    local output = io.open(path, 'wb')
+    if input and output then
+        local seekOk, seekPos = pcall(input.seek, input, 'set', FRAMEBUFFER_OFFSET_BYTES)
+        local ok = false
+        if seekOk and seekPos then
+            ok = copyStream(input, output, FRAMEBUFFER_SIZE_BYTES)
+        end
+        input:close()
+        output:close()
+        if ok and fileSize(path) >= FRAMEBUFFER_SIZE_BYTES then
+            return true
+        end
+        removeFile(path)
+    else
+        if input then input:close() end
+        if output then output:close() end
+    end
+
+    os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(STRIDE_BYTES) .. ' skip=' .. tostring(SCREEN_H) .. ' count=' .. tostring(SCREEN_H) .. ' 2>/dev/null')
+    if fileSize(path) >= FRAMEBUFFER_SIZE_BYTES then
+        return true
+    end
+    removeFile(path)
+    return false
+end
+
+local function screenshotDiagText(state)
+    local allocated = 0
+    local ok, kb = pcall(collectgarbage, 'count')
+    if ok and kb then
+        allocated = math.floor((tonumber(kb) or 0) * 1024)
+    end
+    return 'request_size=' .. tostring(FRAMEBUFFER_SIZE_BYTES)
+        .. '\ntotal_free_heap=-'
+        .. '\nlargest_free_block=-'
+        .. '\ncurrent_allocated=' .. tostring(allocated)
+        .. '\npid=-'
+        .. '\ntid=-'
+        .. '\nscreenshot_state=' .. tostring(state or '-')
+        .. '\nframebuffer_size=' .. tostring(FRAMEBUFFER_SIZE_BYTES)
+        .. '\npixel_format=bgr888'
+        .. '\nscreen=' .. tostring(SCREEN_W) .. 'x' .. tostring(SCREEN_H)
+        .. '\nstride_bytes=' .. tostring(STRIDE_BYTES)
+end
+
 local function extractRgb888(rawData)
     local rows = {}
     for y = 0, SCREEN_H - 1 do
@@ -1084,18 +1358,11 @@ end
 local function captureScreenshot(req)
     mkdir(SCREENSHOT_DIR)
     removeFile(TMP_RAW)
-    os.execute('dd if=' .. FB_PATH .. ' of=' .. TMP_RAW .. ' bs=' .. tostring(STRIDE_BYTES) .. ' skip=' .. tostring(SCREEN_H) .. ' count=' .. tostring(SCREEN_H) .. ' 2>/dev/null')
-
-    local fRaw = io.open(TMP_RAW, 'rb')
-    if not fRaw then
-        return nil, '无法读取截图临时文件'
-    end
-
-    local rawData = fRaw:read('*a') or ''
-    fRaw:close()
-    local needBytes = STRIDE_BYTES * SCREEN_H
-    if #rawData < needBytes then
+    addLog('[shot] capture request bytes=' .. tostring(FRAMEBUFFER_SIZE_BYTES))
+    writeLuaEventLog('截图诊断', '开始采集', screenshotDiagText('capture_start'))
+    if not captureFramebufferToFile(TMP_RAW) then
         removeFile(TMP_RAW)
+        writeLuaEventLog('截图诊断', '采集失败', screenshotDiagText('capture_failed'))
         return nil, '截图数据不足'
     end
 
@@ -1119,7 +1386,7 @@ local function captureScreenshot(req)
         quickPath = 'internal://files/screenshots/' .. filename
         metaFile = buildScreenshotMetaFilename(shotId)
         metaQuickPath = 'internal://files/screenshots/' .. metaFile
-        ok = writeBinaryFile(outPath, rawData)
+        ok = copyFileChunked(TMP_RAW, outPath, FRAMEBUFFER_SIZE_BYTES)
         if not ok then
             removeFile(TMP_RAW)
             return nil, '原始像素写入失败'
@@ -1131,21 +1398,17 @@ local function captureScreenshot(req)
             screenWidth = SCREEN_W,
             screenHeight = SCREEN_H,
             strideBytes = STRIDE_BYTES,
-            rawBytes = #rawData,
+            rawBytes = fileSize(outPath),
             pixelFormatGuess = 'bgr888',
             source = 'framebuffer_raw'
         }))
         source = 'framebuffer_raw'
         message = '原始像素已保存'
     else
-        local rgbData = extractRgb888(rawData)
-        rawData = nil
-        pcall(collectgarbage, 'collect')
         filename = buildScreenshotFilename(shotId)
         outPath = SCREENSHOT_DIR .. filename
         quickPath = 'internal://files/screenshots/' .. filename
-        ok = writePng(outPath, SCREEN_W, SCREEN_H, rgbData)
-        rgbData = nil
+        ok = writePngFromRaw(TMP_RAW, outPath, SCREEN_W, SCREEN_H)
         if not ok then
             removeFile(TMP_RAW)
             pcall(collectgarbage, 'collect')
@@ -1153,9 +1416,9 @@ local function captureScreenshot(req)
         end
     end
 
-    rawData = nil
     removeFile(TMP_RAW)
     pcall(collectgarbage, 'collect')
+    writeLuaEventLog('截图诊断', '采集完成', screenshotDiagText('capture_done'))
     os.execute('sync')
 
     local item = {
