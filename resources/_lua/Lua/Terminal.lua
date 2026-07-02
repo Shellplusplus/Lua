@@ -19,8 +19,6 @@ local LOG_HISTORY_LIMIT = 30
 local TMP_RAW = '/tmp/shell_screenshot.raw'
 local STRIDE_BYTES = SCREEN_W * 3
 local SCREENSHOT_CHUNK_SIZE = 32 * 1024
-local FRAMEBUFFER_OFFSET_BYTES = STRIDE_BYTES * SCREEN_H
-local FRAMEBUFFER_SIZE_BYTES = STRIDE_BYTES * SCREEN_H
 
 
 
@@ -252,6 +250,65 @@ local function fileSize(path)
     f:close()
     if not seekOk then return 0 end
     return tonumber(size) or 0
+end
+
+local function padFileToSize(path, totalBytes)
+    local size = fileSize(path)
+    if size >= totalBytes then return true end
+    local f = io.open(path, 'ab')
+    if not f then return false end
+    local remaining = totalBytes - size
+    local zeros = string.rep('\0', 1024)
+    while remaining > 0 do
+        local n = remaining > 1024 and 1024 or remaining
+        local ok = pcall(f.write, f, zeros:sub(1, n))
+        if not ok then
+            f:close()
+            return false
+        end
+        remaining = remaining - n
+    end
+    f:close()
+    return true
+end
+
+local function isRedmiWatch6()
+    local product = string.lower(tostring(activeDeviceProduct or ''))
+    local model = string.lower(tostring(activeDeviceModel or ''))
+    return product == 'redmi watch 6'
+        or product == 'redmi watch6'
+        or product:find('redmi watch 6', 1, true) ~= nil
+        or product:find('redmi watch6', 1, true) ~= nil
+        or model == 'm2523w1'
+end
+
+local function getScreenshotProfile()
+    local skipRows = SCREEN_H
+    local method = 'legacy'
+    local name = 'legacy'
+    local minRows = SCREEN_H
+
+    if isRedmiWatch6() then
+        method = 'stream'
+        name = 'redmi_watch6'
+        if SCREEN_W == 432 and SCREEN_H == 514 then
+            skipRows = 512
+            minRows = 512
+        end
+    end
+
+    return {
+        name = name,
+        method = method,
+        width = SCREEN_W,
+        height = SCREEN_H,
+        strideBytes = STRIDE_BYTES,
+        skipRows = skipRows,
+        offsetBytes = STRIDE_BYTES * skipRows,
+        rawBytes = STRIDE_BYTES * SCREEN_H,
+        minRawBytes = STRIDE_BYTES * minRows,
+        pixelFormat = 'bgr888'
+    }
 end
 
 local function setTargetDir(path)
@@ -1290,19 +1347,23 @@ local function copyFileChunked(srcPath, dstPath, totalBytes)
     return false
 end
 
-local function captureFramebufferToFile(path)
+local function captureFramebufferToFile(path, profile)
+    profile = profile or getScreenshotProfile()
     removeFile(path)
     local input = io.open(FB_PATH, 'rb')
     local output = io.open(path, 'wb')
     if input and output then
-        local seekOk, seekPos = pcall(input.seek, input, 'set', FRAMEBUFFER_OFFSET_BYTES)
-        local ok = false
+        local seekOk, seekPos = pcall(input.seek, input, 'set', profile.offsetBytes)
         if seekOk and seekPos then
-            ok = copyStream(input, output, FRAMEBUFFER_SIZE_BYTES)
+            copyStream(input, output, profile.rawBytes)
         end
         input:close()
         output:close()
-        if ok and fileSize(path) >= FRAMEBUFFER_SIZE_BYTES then
+        local size = fileSize(path)
+        if size >= profile.rawBytes then
+            return true
+        end
+        if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
             return true
         end
         removeFile(path)
@@ -1311,31 +1372,53 @@ local function captureFramebufferToFile(path)
         if output then output:close() end
     end
 
-    os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(STRIDE_BYTES) .. ' skip=' .. tostring(SCREEN_H) .. ' count=' .. tostring(SCREEN_H) .. ' 2>/dev/null')
-    if fileSize(path) >= FRAMEBUFFER_SIZE_BYTES then
+    os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(profile.strideBytes) .. ' skip=' .. tostring(profile.skipRows) .. ' count=' .. tostring(profile.height) .. ' 2>/dev/null')
+    local size = fileSize(path)
+    if size >= profile.rawBytes then
+        return true
+    end
+    if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
         return true
     end
     removeFile(path)
     return false
 end
 
-local function screenshotDiagText(state)
+local function captureFramebufferLegacy(path, profile)
+    profile = profile or getScreenshotProfile()
+    removeFile(path)
+    os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(profile.strideBytes) .. ' skip=' .. tostring(profile.skipRows) .. ' count=' .. tostring(profile.height) .. ' 2>/dev/null')
+    local size = fileSize(path)
+    if size >= profile.rawBytes then
+        return true
+    end
+    if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
+        return true
+    end
+    removeFile(path)
+    return false
+end
+
+local function screenshotDiagText(state, profile)
+    profile = profile or getScreenshotProfile()
     local allocated = 0
     local ok, kb = pcall(collectgarbage, 'count')
     if ok and kb then
         allocated = math.floor((tonumber(kb) or 0) * 1024)
     end
-    return 'request_size=' .. tostring(FRAMEBUFFER_SIZE_BYTES)
+    return 'request_size=' .. tostring(profile.rawBytes)
         .. '\ntotal_free_heap=-'
         .. '\nlargest_free_block=-'
         .. '\ncurrent_allocated=' .. tostring(allocated)
         .. '\npid=-'
         .. '\ntid=-'
         .. '\nscreenshot_state=' .. tostring(state or '-')
-        .. '\nframebuffer_size=' .. tostring(FRAMEBUFFER_SIZE_BYTES)
-        .. '\npixel_format=bgr888'
-        .. '\nscreen=' .. tostring(SCREEN_W) .. 'x' .. tostring(SCREEN_H)
-        .. '\nstride_bytes=' .. tostring(STRIDE_BYTES)
+        .. '\nframebuffer_size=' .. tostring(profile.rawBytes)
+        .. '\npixel_format=' .. tostring(profile.pixelFormat)
+        .. '\nscreenshot_profile=' .. tostring(profile.name)
+        .. '\nscreen=' .. tostring(profile.width) .. 'x' .. tostring(profile.height)
+        .. '\nstride_bytes=' .. tostring(profile.strideBytes)
+        .. '\nskip_rows=' .. tostring(profile.skipRows)
 end
 
 local function extractRgb888(rawData)
@@ -1358,11 +1441,19 @@ end
 local function captureScreenshot(req)
     mkdir(SCREENSHOT_DIR)
     removeFile(TMP_RAW)
-    addLog('[shot] capture request bytes=' .. tostring(FRAMEBUFFER_SIZE_BYTES))
-    writeLuaEventLog('截图诊断', '开始采集', screenshotDiagText('capture_start'))
-    if not captureFramebufferToFile(TMP_RAW) then
+    local profile = getScreenshotProfile()
+    local isStreamProfile = profile.method == 'stream'
+    addLog('[shot] capture profile=' .. tostring(profile.name) .. ' bytes=' .. tostring(profile.rawBytes))
+    writeLuaEventLog('截图诊断', '开始采集', screenshotDiagText('capture_start', profile))
+    local captured = false
+    if isStreamProfile then
+        captured = captureFramebufferToFile(TMP_RAW, profile)
+    else
+        captured = captureFramebufferLegacy(TMP_RAW, profile)
+    end
+    if not captured then
         removeFile(TMP_RAW)
-        writeLuaEventLog('截图诊断', '采集失败', screenshotDiagText('capture_failed'))
+        writeLuaEventLog('截图诊断', '采集失败', screenshotDiagText('capture_failed', profile))
         return nil, '截图数据不足'
     end
 
@@ -1379,6 +1470,22 @@ local function captureScreenshot(req)
     local ok = false
     local source = 'framebuffer'
     local message = '截图完成'
+    local rawData = nil
+
+    if not isStreamProfile then
+        local fRaw = io.open(TMP_RAW, 'rb')
+        if not fRaw then
+            removeFile(TMP_RAW)
+            return nil, '无法读取截图临时文件'
+        end
+        rawData = fRaw:read('*a') or ''
+        fRaw:close()
+        if #rawData < profile.rawBytes then
+            rawData = nil
+            removeFile(TMP_RAW)
+            return nil, '截图数据不足'
+        end
+    end
 
     if debugConfig.saveRaw then
         filename = buildScreenshotRawFilename(shotId)
@@ -1386,8 +1493,13 @@ local function captureScreenshot(req)
         quickPath = 'internal://files/screenshots/' .. filename
         metaFile = buildScreenshotMetaFilename(shotId)
         metaQuickPath = 'internal://files/screenshots/' .. metaFile
-        ok = copyFileChunked(TMP_RAW, outPath, FRAMEBUFFER_SIZE_BYTES)
+        if isStreamProfile then
+            ok = copyFileChunked(TMP_RAW, outPath, profile.rawBytes)
+        else
+            ok = writeBinaryFile(outPath, rawData)
+        end
         if not ok then
+            rawData = nil
             removeFile(TMP_RAW)
             return nil, '原始像素写入失败'
         end
@@ -1408,17 +1520,27 @@ local function captureScreenshot(req)
         filename = buildScreenshotFilename(shotId)
         outPath = SCREENSHOT_DIR .. filename
         quickPath = 'internal://files/screenshots/' .. filename
-        ok = writePngFromRaw(TMP_RAW, outPath, SCREEN_W, SCREEN_H)
+        if isStreamProfile then
+            ok = writePngFromRaw(TMP_RAW, outPath, profile.width, profile.height)
+        else
+            local rgbData = extractRgb888(rawData)
+            rawData = nil
+            pcall(collectgarbage, 'collect')
+            ok = writePng(outPath, profile.width, profile.height, rgbData)
+            rgbData = nil
+        end
         if not ok then
+            rawData = nil
             removeFile(TMP_RAW)
             pcall(collectgarbage, 'collect')
             return nil, 'PNG 写入失败'
         end
     end
 
+    rawData = nil
     removeFile(TMP_RAW)
     pcall(collectgarbage, 'collect')
-    writeLuaEventLog('截图诊断', '采集完成', screenshotDiagText('capture_done'))
+    writeLuaEventLog('截图诊断', '采集完成', screenshotDiagText('capture_done', profile))
     os.execute('sync')
 
     local item = {
