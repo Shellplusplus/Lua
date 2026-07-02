@@ -287,13 +287,17 @@ local function getScreenshotProfile()
     local method = 'legacy'
     local name = 'legacy'
     local minRows = SCREEN_H
+    local readRows = SCREEN_H
+    local candidateSkipRows = nil
 
     if isRedmiWatch6() then
         method = 'stream'
         name = 'redmi_watch6'
         if SCREEN_W == 432 and SCREEN_H == 514 then
             skipRows = 0
-            minRows = SCREEN_H
+            minRows = 512
+            readRows = 512
+            candidateSkipRows = { 0, 512 }
         end
     end
 
@@ -306,8 +310,11 @@ local function getScreenshotProfile()
         skipRows = skipRows,
         offsetBytes = STRIDE_BYTES * skipRows,
         rawBytes = STRIDE_BYTES * SCREEN_H,
+        readBytes = STRIDE_BYTES * readRows,
+        readRows = readRows,
         minRawBytes = STRIDE_BYTES * minRows,
-        pixelFormat = 'bgr888'
+        pixelFormat = 'bgr888',
+        candidateSkipRows = candidateSkipRows
     }
 end
 
@@ -1347,7 +1354,52 @@ local function copyFileChunked(srcPath, dstPath, totalBytes)
     return false
 end
 
-local function captureFramebufferToFile(path, profile)
+local function cloneScreenshotProfile(profile, skipRows)
+    return {
+        name = profile.name,
+        method = profile.method,
+        width = profile.width,
+        height = profile.height,
+        strideBytes = profile.strideBytes,
+        skipRows = skipRows,
+        offsetBytes = profile.strideBytes * skipRows,
+        rawBytes = profile.rawBytes,
+        readBytes = profile.readBytes or profile.rawBytes,
+        readRows = profile.readRows or profile.height,
+        minRawBytes = profile.minRawBytes or profile.rawBytes,
+        pixelFormat = profile.pixelFormat
+    }
+end
+
+local function scoreScreenshotRaw(path, profile)
+    local f = io.open(path, 'rb')
+    if not f then return -1 end
+    local score = 0
+    local rowLen = profile.strideBytes
+    local step = 6
+    for y = 1, profile.height do
+        local row = f:read(rowLen)
+        if not row or #row < rowLen then break end
+        if y % 4 == 0 then
+            local x = 1
+            while x <= rowLen - 2 do
+                local b = string.byte(row, x) or 0
+                local g = string.byte(row, x + 1) or 0
+                local r = string.byte(row, x + 2) or 0
+                if b > 180 and g > 70 and g < 180 and r < 80 then
+                    score = score + 8
+                elseif b > 130 and g > 40 and r < 100 then
+                    score = score + 1
+                end
+                x = x + step * 3
+            end
+        end
+    end
+    f:close()
+    return score
+end
+
+local function captureFramebufferSingleToFile(path, profile)
     profile = profile or getScreenshotProfile()
     removeFile(path)
     local input = io.open(FB_PATH, 'rb')
@@ -1355,7 +1407,7 @@ local function captureFramebufferToFile(path, profile)
     if input and output then
         local seekOk, seekPos = pcall(input.seek, input, 'set', profile.offsetBytes)
         if seekOk and seekPos then
-            copyStream(input, output, profile.rawBytes)
+            copyStream(input, output, profile.readBytes or profile.rawBytes)
         end
         input:close()
         output:close()
@@ -1372,7 +1424,7 @@ local function captureFramebufferToFile(path, profile)
         if output then output:close() end
     end
 
-    os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(profile.strideBytes) .. ' skip=' .. tostring(profile.skipRows) .. ' count=' .. tostring(profile.height) .. ' 2>/dev/null')
+    os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(profile.strideBytes) .. ' skip=' .. tostring(profile.skipRows) .. ' count=' .. tostring(profile.readRows or profile.height) .. ' 2>/dev/null')
     local size = fileSize(path)
     if size >= profile.rawBytes then
         return true
@@ -1382,6 +1434,42 @@ local function captureFramebufferToFile(path, profile)
     end
     removeFile(path)
     return false
+end
+
+local function captureFramebufferToFile(path, profile)
+    profile = profile or getScreenshotProfile()
+    if type(profile.candidateSkipRows) ~= 'table' or #profile.candidateSkipRows == 0 then
+        return captureFramebufferSingleToFile(path, profile)
+    end
+
+    local bestPath = ''
+    local bestScore = -1
+    for i, skipRows in ipairs(profile.candidateSkipRows) do
+        local candidateProfile = cloneScreenshotProfile(profile, skipRows)
+        local candidatePath = path .. '.p' .. tostring(i)
+        if captureFramebufferSingleToFile(candidatePath, candidateProfile) then
+            local score = scoreScreenshotRaw(candidatePath, candidateProfile)
+            addLog('[shot] candidate skip=' .. tostring(skipRows) .. ' score=' .. tostring(score))
+            if score > bestScore then
+                if bestPath ~= '' then removeFile(bestPath) end
+                bestPath = candidatePath
+                bestScore = score
+                profile.skipRows = skipRows
+                profile.offsetBytes = candidateProfile.offsetBytes
+            else
+                removeFile(candidatePath)
+            end
+        else
+            removeFile(candidatePath)
+        end
+    end
+
+    if bestPath == '' then
+        return false
+    end
+    local ok = copyFileChunked(bestPath, path, profile.rawBytes)
+    removeFile(bestPath)
+    return ok
 end
 
 local function captureFramebufferLegacy(path, profile)
@@ -1419,6 +1507,7 @@ local function screenshotDiagText(state, profile)
         .. '\nscreen=' .. tostring(profile.width) .. 'x' .. tostring(profile.height)
         .. '\nstride_bytes=' .. tostring(profile.strideBytes)
         .. '\nskip_rows=' .. tostring(profile.skipRows)
+        .. '\nread_rows=' .. tostring(profile.readRows or profile.height)
 end
 
 local function extractRgb888(rawData)
