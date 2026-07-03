@@ -2204,6 +2204,7 @@ local function startService()
     pcall(os.execute, 'mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
     rotateIpcGuard()
+    writeHeartbeat()
     addLog('>>> Service Started')
     writeLuaEventLog('服务启动', 'Terminal Bridge 已启动',
         '设备代号: ' .. activeDeviceProduct
