@@ -68,8 +68,11 @@ local UI_TOPBAR_H = 56          -- 顶部返回/标题栏高度（紧凑）
 local HOME_PAD = 20             -- 表盘数据左边距
 
 -- 当前页面与各页面控件引用（切页后重建，故用 forward 局部，配合 nil 守卫）
-local currentPage = 'home'      -- 'home' | 'shell'
+local currentPage = 'home'      -- 'home' | 'shell' | 'log'
 local terminal = nil
+local logTerminal = nil
+local logTapCount = 0
+local logLastTapAt = 0
 local startBtn = nil
 local startBtnLabel = nil
 local clearBtn = nil
@@ -80,7 +83,7 @@ local spriteCells = nil         -- 像素方块网格（lvgl.Object 数组）
 local spriteFrame = 0
 local clockTimer = nil
 local spriteTimer = nil
-local buildHomePage, buildShellPage   -- 互相跳转，提前声明
+local buildHomePage, buildShellPage, buildLogPage   -- 互相跳转，提前声明
 
 -- 根容器只创建一次；切页时 root:clean() 重建子节点，flag 保留在 root 上
 local root = lvgl.Object(nil, {
@@ -195,7 +198,27 @@ local function buildTerminalText()
 end
 
 local function refreshTerminal()
-    if terminal then terminal:set { text = buildTerminalText() } end
+    local text = buildTerminalText()
+    if terminal then terminal:set { text = text } end
+    if logTerminal then logTerminal:set { text = text } end
+end
+
+local function resetLogTap()
+    logTapCount = 0
+    logLastTapAt = 0
+end
+
+local function onLogCardClicked()
+    local now = os.time()
+    if now - logLastTapAt > 2 then
+        logTapCount = 0
+    end
+    logTapCount = logTapCount + 1
+    logLastTapAt = now
+    if logTapCount >= 2 then
+        resetLogTap()
+        buildLogPage()
+    end
 end
 
 -- ====== 工具函数 ======
@@ -2267,6 +2290,8 @@ buildHomePage = function()
     currentPage = 'home'
     -- shell 页控件已随 root:clean() 销毁，引用置空以触发各刷新函数的 nil 守卫
     terminal = nil
+    logTerminal = nil
+    resetLogTap()
     startBtn = nil
     startBtnLabel = nil
     clearBtn = nil
@@ -2325,6 +2350,8 @@ end
 -- shell：终端页。左侧返回按钮、右侧标题 shell++；中部日志卡片；底部 START/STOP、CLEAR
 buildShellPage = function()
     currentPage = 'shell'
+    logTerminal = nil
+    resetLogTap()
     timeLabel = nil
     dateLabel = nil
     weekLabel = nil
@@ -2377,9 +2404,9 @@ buildShellPage = function()
         border_width = 0,
         pad_all = 14,
     })
-    terminal:clear_flag(lvgl.FLAG.SCROLLABLE)
-    terminal:clear_flag(lvgl.FLAG.CLICKABLE)
-    terminal:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    terminal:add_flag(lvgl.FLAG.SCROLLABLE)
+    terminal:add_flag(lvgl.FLAG.CLICKABLE)
+    terminal:onevent(lvgl.EVENT.CLICKED, function() onLogCardClicked() end)
 
     startBtn = lvgl.Object(root, {
         x = UI_GAP, y = panelY,
@@ -2420,6 +2447,87 @@ buildShellPage = function()
     })
     clearLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
     clearBtn:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
+
+    refreshTerminal()
+end
+
+-- log：独立日志页。双击 shell 日志卡片进入，支持滚动查看长日志
+buildLogPage = function()
+    currentPage = 'log'
+    timeLabel = nil
+    dateLabel = nil
+    weekLabel = nil
+    spriteCells = nil
+    terminal = nil
+    logTerminal = nil
+    startBtn = nil
+    startBtnLabel = nil
+    clearBtn = nil
+    root:clean()
+
+    local backDiam = UI_TOPBAR_H - UI_GAP
+    local backBtn = lvgl.Object(root, {
+        x = UI_GAP, y = UI_GAP,
+        w = backDiam, h = backDiam,
+        bg_color = UI_CARD,
+        radius = math.floor(backDiam / 2),
+        border_width = 0,
+        pad_all = 0,
+    })
+    backBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    backBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    local backLbl = lvgl.Label(backBtn, {
+        align = lvgl.ALIGN.CENTER,
+        text = '<',
+        text_font = lvgl.Font("MiSans-Regular", 32),
+        text_color = UI_TEXT,
+    })
+    backLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    backBtn:onevent(lvgl.EVENT.CLICKED, function() buildShellPage() end)
+
+    lvgl.Label(root, {
+        x = 88, y = 14,
+        text = '日志输出',
+        text_font = lvgl.Font("MiSans-Regular", 30),
+        text_color = UI_TEXT,
+    })
+
+    local clearW = 116
+    local clearH = UI_BTN_H
+    local clearY = SCREEN_H - UI_GAP - clearH
+    logTerminal = lvgl.Textarea(root, {
+        x = UI_GAP, y = UI_TOPBAR_H + UI_GAP,
+        w = SCREEN_W - UI_GAP * 2,
+        h = clearY - UI_GAP - (UI_TOPBAR_H + UI_GAP),
+        text = '',
+        bg_color = UI_CARD,
+        radius = UI_CARD_RADIUS,
+        text_font = lvgl.Font("MiSans-Regular", 20),
+        text_color = UI_TERM_TEXT,
+        border_width = 0,
+        pad_all = 14,
+    })
+    logTerminal:add_flag(lvgl.FLAG.SCROLLABLE)
+    logTerminal:add_flag(lvgl.FLAG.CLICKABLE)
+
+    local clearBtnLog = lvgl.Object(root, {
+        x = SCREEN_W - UI_GAP - clearW, y = clearY,
+        w = clearW, h = clearH,
+        bg_color = UI_CARD,
+        radius = UI_BTN_RADIUS,
+        border_width = 0,
+        pad_all = 0,
+    })
+    clearBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
+    clearBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
+    local clearLbl = lvgl.Label(clearBtnLog, {
+        align = lvgl.ALIGN.CENTER,
+        text = 'CLEAR',
+        text_font = lvgl.Font("MiSans-Regular", 28),
+        text_color = UI_TEXT,
+    })
+    clearLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    clearBtnLog:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
 
     refreshTerminal()
 end
