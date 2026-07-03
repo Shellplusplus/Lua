@@ -36,6 +36,7 @@ local screenshotPending = false
 local screenshotReq = nil
 local screenshotWaitStartedAt = 0
 local screenshotPhase = ''
+local localScreenshotSeq = 0
 local activeDeviceProduct = '-'
 local activeDeviceModel = '-'
 local activeDeviceSourceDir = ''
@@ -1880,6 +1881,45 @@ local function prepareScreenshotRequest(req)
     writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n状态: 请熄屏后重新亮屏')
 end
 
+local function captureLogPageScreenshot()
+    if cmdBusy then
+        addLog('[shot] busy')
+        return
+    end
+    if not isRunning then
+        addLog('[shot] service not running')
+        return
+    end
+    localScreenshotSeq = localScreenshotSeq + 1
+    local req = {
+        seq = localScreenshotSeq,
+        type = 'screenshot',
+        timestamp = os.time(),
+        source = 'lua_log_page'
+    }
+    screenshotReq = req
+    screenshotPhase = 'capture_now'
+    cmdBusy = true
+    busyMode = 'screenshot'
+    writeBridgeState(true, 'screenshot', '日志页截图中')
+    writeScreenshotResult({
+        type = 'screenshot_result',
+        seq = req.seq,
+        status = 'capturing',
+        message = '日志页截图中',
+        timestamp = os.date('%H:%M:%S')
+    })
+    addLog('[shot] capture from log page')
+    local item, err = captureScreenshot(req)
+    if item then
+        addLog('[shot] saved #' .. tostring(item.index))
+        finishScreenshotSuccess(item)
+    else
+        addLog('[shot] failed: ' .. tostring(err))
+        finishScreenshotError(err or '截图失败')
+    end
+end
+
 local function normalizeFileManagerPath(path)
     path = tostring(path or '/')
     if path == '' then path = '/' end
@@ -2492,6 +2532,7 @@ buildLogPage = function()
         text_color = UI_TEXT,
     })
 
+    local shotW = 116
     local clearW = 116
     local clearH = UI_BTN_H
     local clearY = SCREEN_H - UI_GAP - clearH
@@ -2509,6 +2550,25 @@ buildLogPage = function()
     })
     logTerminal:add_flag(lvgl.FLAG.SCROLLABLE)
     logTerminal:add_flag(lvgl.FLAG.CLICKABLE)
+
+    local shotBtnLog = lvgl.Object(root, {
+        x = UI_GAP, y = clearY,
+        w = shotW, h = clearH,
+        bg_color = UI_PRIMARY,
+        radius = UI_BTN_RADIUS,
+        border_width = 0,
+        pad_all = 0,
+    })
+    shotBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
+    shotBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
+    local shotLbl = lvgl.Label(shotBtnLog, {
+        align = lvgl.ALIGN.CENTER,
+        text = '截图',
+        text_font = lvgl.Font("MiSans-Regular", 28),
+        text_color = UI_TEXT,
+    })
+    shotLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    shotBtnLog:onevent(lvgl.EVENT.CLICKED, function() captureLogPageScreenshot() end)
 
     local clearBtnLog = lvgl.Object(root, {
         x = SCREEN_W - UI_GAP - clearW, y = clearY,
