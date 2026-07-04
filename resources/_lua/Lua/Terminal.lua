@@ -1881,6 +1881,7 @@ local function prepareScreenshotRequest(req)
     writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n状态: 请熄屏后重新亮屏')
 end
 
+--[[
 local function captureLogPageScreenshot()
     if cmdBusy then
         addLog('[shot] busy')
@@ -1919,6 +1920,7 @@ local function captureLogPageScreenshot()
         finishScreenshotError(err or '截图失败')
     end
 end
+]]
 
 local function normalizeFileManagerPath(path)
     path = tostring(path or '/')
@@ -2532,7 +2534,10 @@ buildLogPage = function()
         text_color = UI_TEXT,
     })
 
+--[[
+Shell++ disabled: 按要求注释保留日志二级页截图按钮宽度。
     local shotW = 116
+]]
     local clearW = 116
     local clearH = UI_BTN_H
     local clearY = SCREEN_H - UI_GAP - clearH
@@ -2551,6 +2556,7 @@ buildLogPage = function()
     logTerminal:add_flag(lvgl.FLAG.SCROLLABLE)
     logTerminal:add_flag(lvgl.FLAG.CLICKABLE)
 
+--[[
     local shotBtnLog = lvgl.Object(root, {
         x = UI_GAP, y = clearY,
         w = shotW, h = clearH,
@@ -2569,6 +2575,8 @@ buildLogPage = function()
     })
     shotLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
     shotBtnLog:onevent(lvgl.EVENT.CLICKED, function() captureLogPageScreenshot() end)
+
+]]
 
     local clearBtnLog = lvgl.Object(root, {
         x = SCREEN_W - UI_GAP - clearW, y = clearY,
