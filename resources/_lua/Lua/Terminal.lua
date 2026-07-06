@@ -876,6 +876,181 @@ function executeCpuMonitorAction(action)
     return '未知 CPU 操作'
 end
 
+
+-- ====== 应用/缓存管理 IPC ======
+
+CACHE_CLEAN_PATHS = {
+    '/data/persist.db.bk',
+    '/data/app/notifications/icon/',
+    '/data/app/notifications/small/',
+    '/data/mass/tmp/watchface/',
+    '/data/mass/tmp/ota/',
+    '/data/mass/tmp/res/',
+    '/data/mass/tmp/app/',
+    '/data/quickapp/cache',
+    '/data/quickapp/tmp',
+    '/data/offlinelog/',
+    '/data/power_event/',
+    '/data/usage_stats/',
+    '/data/app/cache',
+    '/data/cache/',
+    '/data/log/',
+    '/data/tmp/',
+}
+
+function cachePathDisplayName(path)
+    local name = tostring(path or '')
+    name = name:gsub('/+$', '')
+    local idx = name:match('^.*()/')
+    if idx then name = name:sub(idx + 1) end
+    if name == '' then name = tostring(path or '') end
+    return name
+end
+
+function formatCacheSize(size)
+    size = tonumber(size) or 0
+    if size >= 1024 * 1024 then
+        return string.format('%.2f MB', size / 1024 / 1024)
+    end
+    if size >= 1024 then
+        return string.format('%.1f KB', size / 1024)
+    end
+    return tostring(size) .. ' B'
+end
+
+function cacheFileSize(path)
+    return fileSize(path)
+end
+
+function cacheFolderSize(path)
+    if not path or path == '' then return 0 end
+    local dir = nil
+    local ok, opened = pcall(function() return lvgl.fs.open_dir(path) end)
+    if not ok or not opened then
+        return cacheFileSize(path)
+    end
+    dir = opened
+    local size = 0
+    local prefix = path
+    if string.sub(prefix, -1) ~= '/' then prefix = prefix .. '/' end
+    while true do
+        local readOk, entry = pcall(dir.read, dir)
+        if not readOk or not entry then break end
+        local isDir = string.byte(entry, 1) == string.byte('/', 1)
+        local cleanName = isDir and string.sub(entry, 2) or entry
+        if cleanName ~= '' and cleanName ~= '.' and cleanName ~= '..' then
+            local fullPath = prefix .. cleanName
+            if isDir then
+                size = size + cacheFolderSize(fullPath)
+            else
+                size = size + cacheFileSize(fullPath)
+            end
+        end
+    end
+    pcall(dir.close, dir)
+    return size
+end
+
+function cachePathExists(path)
+    if fileExists(path) then return true end
+    return dirExists(path)
+end
+
+function deleteCachePath(path)
+    if not cachePathExists(path) then return true end
+    local safe = false
+    for i = 1, #CACHE_CLEAN_PATHS do
+        if path == CACHE_CLEAN_PATHS[i] then safe = true; break end
+    end
+    if not safe then return false end
+    if tostring(path):find('[;&|`$<>]') then return false end
+
+    local okDir, dir = pcall(function() return lvgl.fs.open_dir(path) end)
+    local cmd = nil
+    if okDir and dir then
+        cmd = 'rm -r "' .. tostring(path):gsub('"', '\"') .. '"'
+        pcall(dir.close, dir)
+    elseif fileExists(path) then
+        cmd = 'rm "' .. tostring(path):gsub('"', '\"') .. '"'
+    end
+    if not cmd then return true end
+    local ok = pcall(os.execute, cmd)
+    return ok == true
+end
+
+function deleteMassRootLooseFiles()
+    local folderPath = '/data/mass/'
+    local ok, dir = pcall(function() return lvgl.fs.open_dir(folderPath) end)
+    if not ok or not dir then return end
+    while true do
+        local readOk, entry = pcall(dir.read, dir)
+        if not readOk or not entry then break end
+        local isDir = string.byte(entry, 1) == string.byte('/', 1)
+        if not isDir then
+            pcall(os.remove, folderPath .. entry)
+        end
+    end
+    pcall(dir.close, dir)
+end
+
+function buildCacheItems()
+    local items = {}
+    local total = 0
+    for i = 1, #CACHE_CLEAN_PATHS do
+        local path = CACHE_CLEAN_PATHS[i]
+        local size = cacheFolderSize(path)
+        total = total + size
+        items[#items + 1] = {
+            path = path,
+            name = cachePathDisplayName(path),
+            sizeBytes = size,
+            size = formatCacheSize(size),
+            exists = cachePathExists(path)
+        }
+    end
+    return items, total
+end
+
+function executeAppManagerRequest(req)
+    local action = req and req.action or ''
+    if action == 'cache_status' then
+        local items, total = buildCacheItems()
+        return {
+            status = 'ok',
+            action = action,
+            message = '统计完成',
+            totalBytes = total,
+            totalSize = formatCacheSize(total),
+            items = items
+        }
+    end
+    if action == 'cache_clear' then
+        local beforeItems, beforeTotal = buildCacheItems()
+        for i = 1, #CACHE_CLEAN_PATHS do
+            deleteCachePath(CACHE_CLEAN_PATHS[i])
+        end
+        deleteMassRootLooseFiles()
+        pcall(collectgarbage, 'collect')
+        local afterItems, afterTotal = buildCacheItems()
+        local freed = beforeTotal - afterTotal
+        if freed < 0 then freed = 0 end
+        return {
+            status = 'ok',
+            action = action,
+            message = '清理完成',
+            beforeBytes = beforeTotal,
+            beforeSize = formatCacheSize(beforeTotal),
+            totalBytes = afterTotal,
+            totalSize = formatCacheSize(afterTotal),
+            freedBytes = freed,
+            freedSize = formatCacheSize(freed),
+            beforeItems = beforeItems,
+            items = afterItems
+        }
+    end
+    return { status = 'error', action = action, message = '未知应用管理操作' }
+end
+
 local function randomHex(n)
     local f = io.open('/dev/urandom', 'rb')
     if f then
@@ -942,6 +1117,7 @@ local function commandTouchesProtectedIpc(cmd)
         'cmd_request.json', 'cmd_result.json',
         'screenshot_request.json', 'screenshot_result.json',
         'file_request.json', 'file_result.json',
+        'app_manager_request.json', 'app_manager_result.json',
         'cpu_monitor_request.json', 'cpu_monitor_result.json', 'cpu_monitor_state.json',
         'bridge_state.json', 'ipc_guard.json',
         'screenshot_history.json', 'screenshot_preview_state.json',
@@ -1964,6 +2140,32 @@ local function readScreenshotRequest()
 end
 
 
+
+function readAppManagerRequest()
+    local reqFile = TARGET_DIR .. 'app_manager_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then return nil end
+    end
+    if not json.seq or not json.action then return nil end
+    if not validateIpcGuard(json, 'app_manager_request.json') then return nil end
+    return {
+        seq = json.seq,
+        type = 'app_manager',
+        action = json.action,
+        timestamp = json.timestamp
+    }
+end
+
 function readCpuMonitorRequest()
     local reqFile = TARGET_DIR .. 'cpu_monitor_request.json'
     if not fileExists(reqFile) then return nil end
@@ -2044,6 +2246,17 @@ local function writeCommandResult(req, result)
     os.remove(TARGET_DIR .. 'cmd_request.json')
 end
 
+
+
+function writeAppManagerResult(req, result)
+    result = result or {}
+    result.type = 'app_manager_result'
+    result.seq = req and req.seq or -1
+    result.action = result.action or (req and req.action or '')
+    result.timestamp = os.date('%H:%M:%S')
+    atomicWrite('app_manager_result.json', result)
+    os.remove(TARGET_DIR .. 'app_manager_request.json')
+end
 
 function writeCpuMonitorResult(req, status, message)
     atomicWrite('cpu_monitor_result.json', {
@@ -2451,6 +2664,36 @@ local function checkScreenshotRequest()
 end
 
 
+
+function checkAppManagerRequest()
+    if cmdBusy then return end
+    if not isRunning then return end
+
+    local req = readAppManagerRequest()
+    if not req then return end
+
+    cmdBusy = true
+    busyMode = 'app_manager'
+    writeBridgeState(true, 'app_manager', '应用管理操作中')
+    local ok, result = pcall(function()
+        return executeAppManagerRequest(req)
+    end)
+    if ok then
+        writeAppManagerResult(req, result)
+        if req.action ~= 'cache_status' and req.action ~= 'cache_clear' then
+            writeLuaEventLog('应用管理', req.action or '',
+                '序号: ' .. tostring(req.seq or -1)
+                .. '\n操作: ' .. tostring(req.action or '')
+                .. '\n状态: ' .. tostring(result and result.status or '-'))
+        end
+    else
+        writeAppManagerResult(req, { status = 'error', action = req.action, message = tostring(result or '应用管理操作失败') })
+    end
+    cmdBusy = false
+    busyMode = ''
+    writeBridgeState(false, '', '')
+end
+
 function checkCpuMonitorRequest()
     if not isRunning then return end
 
@@ -2562,6 +2805,7 @@ local function startService()
         cb = function()
             if isRunning then
                 checkCpuMonitorRequest()
+                checkAppManagerRequest()
                 checkFileRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
