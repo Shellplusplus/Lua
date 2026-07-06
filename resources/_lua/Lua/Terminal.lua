@@ -26,6 +26,8 @@ local isRunning = false
 local cmdTimer = nil
 local heartbeatTimer = nil
 local watchdogTimer = nil
+cpuMonitorTimer = nil
+cpuLogClearTimer = nil
 local statusBuffer = {}
 local cmdBusy = false
 local cmdStartTime = nil
@@ -42,6 +44,17 @@ local activeDeviceModel = '-'
 local activeDeviceSourceDir = ''
 local ipcGuardToken = ''
 local ipcGuardSeq = 0
+cpuMonitorEnabled = false
+cpuFloatEnabled = false
+cpuFloatLayer = nil
+cpuFloatLabel = nil
+cpuLatestPercent = 0
+cpuLatestText = 'CPU:0%'
+cpuLogBuffer = {}
+cpuRawLogged = false
+CPU_MONITOR_LOG_LIMIT = 12
+CPU_MONITOR_INTERVAL_MS = 500
+CPU_MONITOR_LOG_CLEAR_MS = 10000
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -660,6 +673,209 @@ local function writeBridgeState(busy, mode, message)
     })
 end
 
+
+-- ====== CPU 悬浮监控 ======
+
+function appendCpuMonitorLog(line)
+    table.insert(cpuLogBuffer, 1, tostring(line or ''))
+    while #cpuLogBuffer > CPU_MONITOR_LOG_LIMIT do
+        table.remove(cpuLogBuffer)
+    end
+end
+
+function readCpuLoad()
+    local f = io.open('/proc/cpuload', 'r')
+    if not f then return 'ERR:open', 0, nil end
+    local content = f:read('*all')
+    f:close()
+    if not content or content == '' then return 'ERR:empty', 0, nil end
+
+    local vals = {}
+    for n in content:gmatch('[%d%.]+') do
+        vals[#vals + 1] = n
+    end
+    if #vals == 0 then return 'NODATA', 0, content end
+
+    local pct = 0
+    if #vals == 1 then
+        pct = math.floor(tonumber(vals[1]) or 0)
+    elseif #vals >= 2 then
+        local total = tonumber(vals[1]) or 0
+        local used = tonumber(vals[2]) or 0
+        if total > 0 then
+            pct = math.floor(used / total * 100)
+        end
+    end
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+    return string.format('CPU:%d%%', pct), pct, content
+end
+
+function writeCpuMonitorState()
+    local logs = {}
+    for i = 1, #cpuLogBuffer do
+        logs[i] = cpuLogBuffer[i]
+    end
+    atomicWriteJson('cpu_monitor_state.json', {
+        type = 'cpu_monitor_state',
+        timestamp = tostring(os.time()),
+        monitoring = cpuMonitorEnabled == true,
+        floating = cpuFloatEnabled == true,
+        percent = cpuLatestPercent,
+        latest = cpuLatestText,
+        logs = logs
+    })
+end
+
+function initCpuFloatLayer()
+    if cpuFloatLayer and cpuFloatLabel then return true end
+    local ok, disp = pcall(function() return lvgl.disp.get_default() end)
+    if not ok or not disp then return false end
+
+    cpuFloatLayer = lvgl.Object(disp:get_layer_top(), {
+        x = 10,
+        y = 0,
+        w = 120,
+        h = 30,
+        bg_opa = lvgl.OPA(0),
+        border_width = 0,
+    })
+    cpuFloatLayer:clear_flag(lvgl.FLAG.CLICKABLE)
+    cpuFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
+
+    cpuFloatLabel = lvgl.Label(cpuFloatLayer, {
+        x = 0,
+        y = 0,
+        w = 120,
+        h = 30,
+        text = cpuLatestText,
+        font_size = 20,
+        font = FONT_24,
+        text_color = '#00ff66',
+        bg_opa = 0,
+    })
+    return true
+end
+
+function updateCpuFloatLabel()
+    if cpuFloatLabel and cpuFloatEnabled then
+        cpuFloatLabel:set { text = cpuLatestText }
+    end
+end
+
+function collectCpuMonitorOnce()
+    local text, pct, raw = readCpuLoad()
+    cpuLatestText = text
+    cpuLatestPercent = pct
+    if not cpuFloatEnabled then
+        appendCpuMonitorLog(string.format('[%s] %s', os.date('%H:%M:%S'), text))
+        if not cpuRawLogged then
+            cpuRawLogged = true
+            local escaped = tostring(raw or 'nil'):gsub('\n', '\\n'):gsub('\r', '\\r')
+            appendCpuMonitorLog('>>> RAW: [' .. escaped .. ']')
+        end
+    end
+    updateCpuFloatLabel()
+    writeCpuMonitorState()
+end
+
+function clearCpuMonitorLogByTimer()
+    if not cpuMonitorEnabled then return end
+    cpuLogBuffer = {}
+    cpuRawLogged = false
+    writeCpuMonitorState()
+end
+
+function startCpuMonitorLogCleaner()
+    if cpuLogClearTimer then
+        cpuLogClearTimer:resume()
+        return
+    end
+    cpuLogClearTimer = lvgl.Timer({ period = CPU_MONITOR_LOG_CLEAR_MS, repeat_count = -1,
+        cb = function() clearCpuMonitorLogByTimer() end })
+    cpuLogClearTimer:resume()
+end
+
+function startCpuMonitor()
+    if cpuMonitorEnabled then return '检测已开启' end
+    cpuMonitorEnabled = true
+    if not cpuMonitorTimer then
+        cpuMonitorTimer = lvgl.Timer({ period = CPU_MONITOR_INTERVAL_MS, repeat_count = -1,
+            cb = function()
+                if cpuMonitorEnabled then collectCpuMonitorOnce() end
+            end })
+    end
+    cpuMonitorTimer:resume()
+    startCpuMonitorLogCleaner()
+    appendCpuMonitorLog('>>> Monitoring Started (500ms interval)')
+    collectCpuMonitorOnce()
+    writeLuaEventLog('CPU检测', '开启检测', '周期: ' .. tostring(CPU_MONITOR_INTERVAL_MS) .. 'ms')
+    return '检测已开启'
+end
+
+function stopCpuMonitor()
+    if not cpuMonitorEnabled then return '检测已停止' end
+    cpuMonitorEnabled = false
+    if cpuMonitorTimer then
+        pcall(function() cpuMonitorTimer:pause() end)
+    end
+    cpuLogBuffer = {}
+    cpuRawLogged = false
+    appendCpuMonitorLog('>>> Monitoring Stopped')
+    writeCpuMonitorState()
+    writeLuaEventLog('CPU检测', '关闭检测', '最后数值: ' .. tostring(cpuLatestText))
+    return '检测已停止'
+end
+
+function clearCpuMonitorLog()
+    cpuLogBuffer = {}
+    cpuRawLogged = false
+    cpuLatestPercent = 0
+    cpuLatestText = 'CPU:0%'
+    updateCpuFloatLabel()
+    writeCpuMonitorState()
+    return '日志已清空'
+end
+
+function showCpuFloatLayer()
+    if not initCpuFloatLayer() then
+        writeCpuMonitorState()
+        return '悬浮层创建失败'
+    end
+    local changed = not cpuFloatEnabled
+    cpuFloatEnabled = true
+    cpuFloatLayer:clear_flag(lvgl.FLAG.HIDDEN)
+    cpuLogBuffer = {}
+    cpuRawLogged = false
+    updateCpuFloatLabel()
+    writeCpuMonitorState()
+    if changed then
+        writeLuaEventLog('CPU悬浮', '开启悬浮', '当前数值: ' .. tostring(cpuLatestText))
+    end
+    return '悬浮已开启'
+end
+
+function hideCpuFloatLayer()
+    local changed = cpuFloatEnabled == true
+    cpuFloatEnabled = false
+    if cpuFloatLayer then cpuFloatLayer:add_flag(lvgl.FLAG.HIDDEN) end
+    writeCpuMonitorState()
+    if changed then
+        writeLuaEventLog('CPU悬浮', '关闭悬浮', '当前数值: ' .. tostring(cpuLatestText))
+    end
+    return '悬浮已关闭'
+end
+
+function executeCpuMonitorAction(action)
+    if action == 'monitor_start' then return startCpuMonitor() end
+    if action == 'monitor_stop' then return stopCpuMonitor() end
+    if action == 'clear' then return clearCpuMonitorLog() end
+    if action == 'float_on' then return showCpuFloatLayer() end
+    if action == 'float_off' then return hideCpuFloatLayer() end
+    if action == 'status' then writeCpuMonitorState(); return '状态已刷新' end
+    return '未知 CPU 操作'
+end
+
 local function randomHex(n)
     local f = io.open('/dev/urandom', 'rb')
     if f then
@@ -726,6 +942,7 @@ local function commandTouchesProtectedIpc(cmd)
         'cmd_request.json', 'cmd_result.json',
         'screenshot_request.json', 'screenshot_result.json',
         'file_request.json', 'file_result.json',
+        'cpu_monitor_request.json', 'cpu_monitor_result.json', 'cpu_monitor_state.json',
         'bridge_state.json', 'ipc_guard.json',
         'screenshot_history.json', 'screenshot_preview_state.json',
         'screenshot_settings.json',
@@ -1746,6 +1963,38 @@ local function readScreenshotRequest()
     }
 end
 
+
+function readCpuMonitorRequest()
+    local reqFile = TARGET_DIR .. 'cpu_monitor_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            return nil
+        end
+    end
+    if not json.seq or not json.action then
+        return nil
+    end
+    if not validateIpcGuard(json, 'cpu_monitor_request.json') then
+        return nil
+    end
+    return {
+        seq = json.seq,
+        type = 'cpu_monitor',
+        action = json.action,
+        timestamp = json.timestamp
+    }
+end
+
 local function readFileRequest()
     local reqFile = TARGET_DIR .. 'file_request.json'
     if not fileExists(reqFile) then return nil end
@@ -1793,6 +2042,19 @@ local function writeCommandResult(req, result)
     }
     atomicWrite('cmd_result.json', res)
     os.remove(TARGET_DIR .. 'cmd_request.json')
+end
+
+
+function writeCpuMonitorResult(req, status, message)
+    atomicWrite('cpu_monitor_result.json', {
+        type = 'cpu_monitor_result',
+        seq = req and req.seq or -1,
+        action = req and req.action or '',
+        status = status or 'ok',
+        message = message or '',
+        timestamp = os.date('%H:%M:%S')
+    })
+    os.remove(TARGET_DIR .. 'cpu_monitor_request.json')
 end
 
 local function writeFileResult(req, result)
@@ -2188,6 +2450,23 @@ local function checkScreenshotRequest()
     prepareScreenshotRequest(req)
 end
 
+
+function checkCpuMonitorRequest()
+    if not isRunning then return end
+
+    local req = readCpuMonitorRequest()
+    if not req then return end
+
+    local ok, message = pcall(function()
+        return executeCpuMonitorAction(req.action)
+    end)
+    if ok then
+        writeCpuMonitorResult(req, 'ok', message or '完成')
+    else
+        writeCpuMonitorResult(req, 'error', tostring(message or 'CPU 操作失败'))
+    end
+end
+
 local function checkFileRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -2268,6 +2547,7 @@ local function startService()
     pcall(os.execute, 'mkdir -p "' .. TARGET_DIR .. '"')
     pcall(os.execute, 'mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
+    writeCpuMonitorState()
     rotateIpcGuard()
     writeHeartbeat()
     addLog('>>> Service Started')
@@ -2281,6 +2561,7 @@ local function startService()
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
             if isRunning then
+                checkCpuMonitorRequest()
                 checkFileRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
@@ -2306,6 +2587,10 @@ local function stopService()
     if cmdTimer then cmdTimer:pause() end
     if heartbeatTimer then heartbeatTimer:pause() end
     if watchdogTimer then watchdogTimer:pause() end
+    if cpuMonitorTimer then cpuMonitorTimer:pause() end
+    if cpuLogClearTimer then cpuLogClearTimer:pause() end
+    cpuMonitorEnabled = false
+    hideCpuFloatLayer()
     cmdBusy = false
     busyMode = ''
     screenshotPending = false
