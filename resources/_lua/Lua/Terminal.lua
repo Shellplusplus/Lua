@@ -1011,6 +1011,248 @@ function buildCacheItems()
     return items, total
 end
 
+function getQuickAppRoot()
+    if fileExists('/data/quickapp/apps.json') or dirExists('/data/quickapp') then
+        return '/data/quickapp/'
+    end
+    return '/data/'
+end
+
+function getAppManagerPaths()
+    local rootPath = getQuickAppRoot()
+    return {
+        root = rootPath,
+        visibleJson = rootPath .. 'apps.json',
+        hiddenJson = rootPath .. 'apps.json_hide',
+        dirs = {
+            rootPath .. 'app/',
+            rootPath .. 'system/',
+            rootPath .. 'cache/',
+            rootPath .. 'files/',
+            rootPath .. 'mass/'
+        }
+    }
+end
+
+function normalizeAppsJson(obj)
+    if type(obj) ~= 'table' then obj = {} end
+    if type(obj.InstalledApps) ~= 'table' then obj.InstalledApps = {} end
+    return obj
+end
+
+function loadAppsJson(path)
+    local text = readFile(path)
+    if not text or text == '' then
+        return { InstalledApps = {} }
+    end
+    return normalizeAppsJson(jsonDecode(text))
+end
+
+function saveAppsJson(path, obj)
+    obj = normalizeAppsJson(obj)
+    return writeFile(path, jsonEncode(obj))
+end
+
+function cloneAppInfo(app)
+    local out = {}
+    if type(app) == 'table' then
+        for k, v in pairs(app) do out[k] = v end
+    end
+    return out
+end
+
+function packageIsShellPlusPlus(packageName)
+    return tostring(packageName or '') == 'com.shell.liangyi'
+end
+
+function appDisplayName(app)
+    return tostring(app.name or app.appName or app.label or app.title or app.package or '')
+end
+
+function appPackage(app)
+    return tostring(app and app.package or '')
+end
+
+function appendManagedApp(list, seen, app, hidden)
+    local packageName = appPackage(app)
+    if packageName == '' or seen[packageName] then return end
+    seen[packageName] = true
+    local item = cloneAppInfo(app)
+    item.package = packageName
+    item.name = appDisplayName(item)
+    item.hidden = hidden == true
+    item.hideFlag = hidden == true and true or nil
+    item.locked = packageIsShellPlusPlus(packageName)
+    list[#list + 1] = item
+end
+
+function buildManagedApps()
+    local paths = getAppManagerPaths()
+    local visible = loadAppsJson(paths.visibleJson)
+    local hidden = loadAppsJson(paths.hiddenJson)
+    local apps = {}
+    local seen = {}
+    for i = 1, #visible.InstalledApps do
+        appendManagedApp(apps, seen, visible.InstalledApps[i], false)
+    end
+    for i = 1, #hidden.InstalledApps do
+        appendManagedApp(apps, seen, hidden.InstalledApps[i], true)
+    end
+    table.sort(apps, function(a, b) return tostring(a.name or a.package) < tostring(b.name or b.package) end)
+    return apps, paths
+end
+
+function selectedPackageSet(req, apps)
+    local set = {}
+    if req.all == true then
+        for i = 1, #apps do
+            if not apps[i].locked then set[apps[i].package] = true end
+        end
+        return set
+    end
+    if type(req.packages) == 'table' then
+        for i = 1, #req.packages do
+            local packageName = tostring(req.packages[i] or '')
+            if packageName ~= '' and not packageIsShellPlusPlus(packageName) then
+                set[packageName] = true
+            end
+        end
+    end
+    return set
+end
+
+function setHasAny(set)
+    for _ in pairs(set) do return true end
+    return false
+end
+
+function moveAppBetweenLists(src, dst, packageSet, makeHidden)
+    local moved = 0
+    local i = 1
+    while i <= #src.InstalledApps do
+        local app = src.InstalledApps[i]
+        local packageName = appPackage(app)
+        if packageSet[packageName] and not packageIsShellPlusPlus(packageName) then
+            local item = cloneAppInfo(app)
+            if makeHidden then item.hideFlag = true else item.hideFlag = nil end
+            table.remove(src.InstalledApps, i)
+            dst.InstalledApps[#dst.InstalledApps + 1] = item
+            moved = moved + 1
+        else
+            i = i + 1
+        end
+    end
+    return moved
+end
+
+function removeAppsFromList(obj, packageSet)
+    local removed = 0
+    local i = 1
+    while i <= #obj.InstalledApps do
+        local packageName = appPackage(obj.InstalledApps[i])
+        if packageSet[packageName] and not packageIsShellPlusPlus(packageName) then
+            table.remove(obj.InstalledApps, i)
+            removed = removed + 1
+        else
+            i = i + 1
+        end
+    end
+    return removed
+end
+
+function safeDeleteAppPackageDir(baseDir, packageName)
+    packageName = tostring(packageName or '')
+    if packageName == '' or packageIsShellPlusPlus(packageName) then return false end
+    if packageName:find('[;&|`$<>/\\]') or packageName:find('%.%.', 1, true) then return false end
+    local path = tostring(baseDir or '') .. packageName .. '/'
+    local ok, dir = pcall(function() return lvgl.fs.open_dir(path) end)
+    if ok and dir then
+        pcall(dir.close, dir)
+        return pcall(os.execute, 'rm -r "' .. path:gsub('"', '\"') .. '"')
+    end
+    return true
+end
+
+function deleteManagedAppFiles(paths, packageSet)
+    local deleted = 0
+    for packageName in pairs(packageSet) do
+        if not packageIsShellPlusPlus(packageName) then
+            for i = 1, #paths.dirs do
+                if safeDeleteAppPackageDir(paths.dirs[i], packageName) then deleted = deleted + 1 end
+            end
+        end
+    end
+    return deleted
+end
+
+function appManagerListResult(action)
+    local apps, paths = buildManagedApps()
+    return {
+        status = 'ok',
+        action = action or 'apps',
+        message = '读取完成',
+        root = paths.root,
+        apps = apps
+    }
+end
+
+function appManagerSetVisible(req)
+    local apps, paths = buildManagedApps()
+    local packageSet = selectedPackageSet(req, apps)
+    if not setHasAny(packageSet) then
+        return { status = 'error', action = req.action, message = '没有可操作的快应用', apps = apps }
+    end
+    local visible = loadAppsJson(paths.visibleJson)
+    local hidden = loadAppsJson(paths.hiddenJson)
+    local moved = 0
+    if req.visible == false or req.operation == 'hide' then
+        moved = moveAppBetweenLists(visible, hidden, packageSet, true)
+    else
+        moved = moveAppBetweenLists(hidden, visible, packageSet, false)
+    end
+    saveAppsJson(paths.visibleJson, visible)
+    saveAppsJson(paths.hiddenJson, hidden)
+    local nextApps = buildManagedApps()
+    return {
+        status = 'ok',
+        action = req.action,
+        message = moved > 0 and ('已处理 ' .. tostring(moved) .. ' 个，重启后生效') or '没有需要变更的快应用',
+        changed = moved,
+        apps = nextApps
+    }
+end
+
+function appManagerDelete(req)
+    local apps, paths = buildManagedApps()
+    local packageSet = selectedPackageSet(req, apps)
+    if not setHasAny(packageSet) then
+        return { status = 'error', action = req.action, message = '没有可删除的快应用', apps = apps }
+    end
+    local visible = loadAppsJson(paths.visibleJson)
+    local hidden = loadAppsJson(paths.hiddenJson)
+    local removed = removeAppsFromList(visible, packageSet) + removeAppsFromList(hidden, packageSet)
+    saveAppsJson(paths.visibleJson, visible)
+    saveAppsJson(paths.hiddenJson, hidden)
+    deleteManagedAppFiles(paths, packageSet)
+    local nextApps = buildManagedApps()
+    return {
+        status = 'ok',
+        action = req.action,
+        message = removed > 0 and ('已删除 ' .. tostring(removed) .. ' 个，建议重启') or '没有找到要删除的快应用',
+        changed = removed,
+        apps = nextApps
+    }
+end
+
+function appManagerReboot(req)
+    local ok = pcall(os.execute, 'reboot')
+    return {
+        status = ok and 'ok' or 'error',
+        action = req and req.action or 'reboot_system',
+        message = ok and '正在重启系统' or '重启命令执行失败'
+    }
+end
+
 function executeAppManagerRequest(req)
     local action = req and req.action or ''
     if action == 'cache_status' then
@@ -1048,6 +1290,10 @@ function executeAppManagerRequest(req)
             items = afterItems
         }
     end
+    if action == 'apps' then return appManagerListResult(action) end
+    if action == 'set_visible' then return appManagerSetVisible(req) end
+    if action == 'delete' then return appManagerDelete(req) end
+    if action == 'reboot_system' then return appManagerReboot(req) end
     return { status = 'error', action = action, message = '未知应用管理操作' }
 end
 
@@ -2162,6 +2408,10 @@ function readAppManagerRequest()
         seq = json.seq,
         type = 'app_manager',
         action = json.action,
+        operation = json.operation,
+        visible = json.visible,
+        all = json.all,
+        packages = json.packages,
         timestamp = json.timestamp
     }
 end
