@@ -65,6 +65,8 @@ local heartbeatTimer = nil
 local watchdogTimer = nil
 cpuMonitorTimer = nil
 cpuLogClearTimer = nil
+memoryMonitorTimer = nil
+memoryLogClearTimer = nil
 local statusBuffer = {}
 local cmdBusy = false
 local cmdStartTime = nil
@@ -89,11 +91,30 @@ cpuLatestPercent = 0
 cpuLatestText = 'CPU:0%'
 cpuLogBuffer = {}
 cpuRawLogged = false
+memoryMonitorEnabled = false
+memoryFloatEnabled = false
+memoryFloatLayer = nil
+memoryFloatLabel = nil
+memoryLatestPercent = 0
+memoryLatestText = 'MEM:0%'
+memoryLogBuffer = {}
+memoryRawLogged = false
+memoryTotalKb = 0
+memoryUsedKb = 0
+memoryAvailableKb = 0
+memoryFreeKb = 0
+memoryLuaKb = 0
 CPU_MONITOR_LOG_LIMIT = 12
 CPU_MONITOR_INTERVAL_MS = 500
 CPU_MONITOR_LOG_CLEAR_MS = 10000
 CPU_FLOAT_W = 150
 CPU_FLOAT_H = 52
+MEMORY_MONITOR_LOG_LIMIT = 12
+MEMORY_MONITOR_INTERVAL_MS = 800
+MEMORY_MONITOR_LOG_CLEAR_MS = 10000
+MEMORY_FLOAT_W = 150
+MEMORY_FLOAT_H = 52
+MEMORY_FLOAT_Y = CPU_FLOAT_H - 6
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -951,6 +972,412 @@ function executeCpuMonitorAction(action)
 end
 
 
+-- ====== 内存悬浮监控 ======
+
+function appendMemoryMonitorLog(line)
+    table.insert(memoryLogBuffer, 1, tostring(line or ''))
+    while #memoryLogBuffer > MEMORY_MONITOR_LOG_LIMIT do
+        table.remove(memoryLogBuffer)
+    end
+end
+
+function formatMemoryKb(kb)
+    kb = tonumber(kb) or 0
+    if kb >= 1024 then
+        return string.format('%.1fMB', kb / 1024)
+    end
+    return tostring(math.floor(kb)) .. 'KB'
+end
+
+function parseMemoryInfoFallback(content)
+    if not content or content == '' then return nil end
+    local previousNumeric = nil
+    local currentNumeric = nil
+    for line in content:gmatch('[^\r\n]+') do
+        local nums = {}
+        for n in line:gmatch('%d+') do
+            nums[#nums + 1] = tonumber(n) or 0
+        end
+        local compact = line:gsub('%s+', '')
+        if compact == 'Umem' and previousNumeric and #previousNumeric >= 3 then
+            return previousNumeric[1], previousNumeric[2], previousNumeric[3]
+        end
+        if #nums >= 3 and not string.find(line, '[%a_]') then
+            previousNumeric = currentNumeric
+            currentNumeric = nums
+        end
+    end
+    local total, used, free = content:match('[%a_]*[Mm]em:%s*(%d+)%s+(%d+)%s+(%d+)')
+    if total then
+        return tonumber(total) or 0, tonumber(used) or 0, tonumber(free) or 0
+    end
+    total, used, free = content:match('[%a_]*[Hh]eap:%s*(%d+)%s+(%d+)%s+(%d+)')
+    if total then
+        return tonumber(total) or 0, tonumber(used) or 0, tonumber(free) or 0
+    end
+    total = content:match('[Tt]otal[^%d]*(%d+)')
+    used = content:match('[Uu]sed[^%d]*(%d+)')
+    free = content:match('[Ff]ree[^%d]*(%d+)')
+    if total then
+        total = tonumber(total) or 0
+        used = tonumber(used) or 0
+        free = tonumber(free) or 0
+        if used <= 0 and free > 0 then used = total - free end
+        return total, used, free
+    end
+    return nil
+end
+
+function normalizeRealtimeMemoryKb(total, used, free, available)
+    total = tonumber(total) or 0
+    used = tonumber(used) or 0
+    free = tonumber(free) or 0
+    available = tonumber(available) or 0
+    if total > 1024 * 1024 or used > 1024 * 1024 or free > 1024 * 1024 or available > 1024 * 1024 then
+        total = math.floor(total / 1024)
+        used = math.floor(used / 1024)
+        free = math.floor(free / 1024)
+        available = math.floor(available / 1024)
+    end
+    return total, used, free, available
+end
+
+function findThreeConsecutiveNumbers(content, minFirst)
+    minFirst = minFirst or 100
+    local nums = {}
+    for n in content:gmatch('%d+') do
+        nums[#nums + 1] = tonumber(n)
+    end
+    for i = 1, #nums - 2 do
+        local a, b, c = nums[i], nums[i + 1], nums[i + 2]
+        if a >= minFirst and b <= a and c <= a then return a, b, c end
+    end
+    return nil
+end
+
+function parseNuttXMemoryInfo(content)
+    if not content or content == '' then return nil end
+
+    for line in content:gmatch('[^\r\n]+') do
+        if line:find('Umem') then
+            local nums = {}
+            for n in line:gmatch('(%d+)') do nums[#nums + 1] = tonumber(n) end
+            if #nums >= 3 then return nums[1], nums[2], nums[3] end
+        end
+    end
+
+    for line in content:gmatch('[^\r\n]+') do
+        local t, u, f = line:match('Umem:%s*(%d+)%s+(%d+)%s+(%d+)')
+        if t then return tonumber(t), tonumber(u), tonumber(f) end
+        t, u, f = line:match('[Mm]em[Tt]otal:%s*(%d+).*[Mm]em[Ff]ree:%s*(%d+)')
+        if t then
+            local tv = tonumber(t)
+            local fv = tonumber(f)
+            if tv and fv then return tv, tv - fv, fv end
+        end
+    end
+
+    local nums = {}
+    for n in content:gmatch('%d+') do nums[#nums + 1] = tonumber(n) end
+    for i = 1, #nums - 2 do
+        local a, b, c = nums[i], nums[i + 1], nums[i + 2]
+        if a >= 1000 and b <= a and c <= a then return a, b, c end
+    end
+    if #nums >= 1 and nums[1] > 1000 then
+        return nums[1], 0, 0
+    end
+
+    return nil
+end
+
+function readMemoryInfo()
+    local luaKb = 0
+    local okGc, gcKb = pcall(function() return collectgarbage('count') end)
+    if okGc and gcKb then luaKb = math.floor(tonumber(gcKb) or 0) end
+
+    local naStats = { totalKb = 0, usedKb = 0, availableKb = 0, freeKb = 0, luaKb = luaKb }
+
+    local f = io.open('/proc/meminfo', 'r')
+    if not f then
+        naStats.source = 'proc_meminfo_open_failed'
+        return 'MEM:N/A', 0, 'open /proc/meminfo failed', naStats
+    end
+    local content = f:read('*all')
+    f:close()
+    if not content or content == '' then
+        naStats.source = 'proc_meminfo_empty'
+        return 'MEM:N/A', 0, 'empty /proc/meminfo', naStats
+    end
+
+    local stats = {}
+    for key, value in content:gmatch('([%w_]+):%s*(%d+)') do
+        stats[key] = tonumber(value) or 0
+    end
+
+    local total = stats.MemTotal or stats.MemTotalKB or stats.Total or 0
+    local free = stats.MemFree or stats.Free or 0
+    local available = stats.MemAvailable or stats.Available or 0
+
+    local nuttxTotal, nuttxUsed, nuttxFree = parseNuttXMemoryInfo(content)
+    if total <= 0 and nuttxTotal then
+        total = nuttxTotal
+        free = nuttxFree or 0
+        available = free
+    end
+
+    if total <= 0 then
+        naStats.source = 'proc_meminfo_parse_failed'
+        return 'MEM:N/A', 0, content, naStats
+    end
+
+    local unitIsKb = content:find('[Kk][Bb]') ~= nil
+    local div = unitIsKb and 1 or 1024
+    if div > 1 then
+        total = math.floor(total / div)
+        free = math.floor(free / div)
+        available = math.floor(available / div)
+    end
+    if nuttxUsed and nuttxUsed > 0 and div > 1 then
+        nuttxUsed = math.floor(nuttxUsed / div)
+        nuttxFree = math.floor((nuttxFree or 0) / div)
+    end
+
+    local buffersKb = math.floor((stats.Buffers or 0) / div)
+    local cachedKb = math.floor((stats.Cached or 0) / div)
+
+    if available <= 0 then
+        available = free + buffersKb + cachedKb
+    end
+
+    local used = 0
+    if nuttxUsed and nuttxUsed > 0 then
+        used = nuttxUsed
+    elseif total > 0 and available > 0 then
+        used = total - available
+    elseif total > 0 and free > 0 then
+        used = total - free
+    elseif total > 0 and buffersKb + cachedKb > 0 then
+        used = total - buffersKb - cachedKb
+    elseif total > 0 then
+        used = total
+    end
+
+    if used < 0 then used = 0 end
+    if total > 0 and used > total then used = total end
+
+    local pct = 0
+    if total > 0 then pct = math.floor(used * 100 / total) end
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+
+    return string.format('MEM:%d%%', pct), pct, content, {
+        totalKb = total,
+        usedKb = used,
+        availableKb = available,
+        freeKb = free,
+        luaKb = luaKb
+    }
+end
+
+function writeMemoryMonitorState()
+    local logs = {}
+    for i = 1, #memoryLogBuffer do
+        logs[i] = memoryLogBuffer[i]
+    end
+    atomicWriteJson('memory_monitor_state.json', {
+        type = 'memory_monitor_state',
+        timestamp = tostring(os.time()),
+        monitoring = memoryMonitorEnabled == true,
+        floating = memoryFloatEnabled == true,
+        percent = memoryLatestPercent,
+        latest = memoryLatestText,
+        totalKb = memoryTotalKb,
+        usedKb = memoryUsedKb,
+        availableKb = memoryAvailableKb,
+        freeKb = memoryFreeKb,
+        luaKb = memoryLuaKb,
+        totalText = formatMemoryKb(memoryTotalKb),
+        usedText = formatMemoryKb(memoryUsedKb),
+        availableText = formatMemoryKb(memoryAvailableKb),
+        freeText = formatMemoryKb(memoryFreeKb),
+        luaText = formatMemoryKb(memoryLuaKb),
+        logs = logs
+    })
+end
+
+function updateMemoryFloatLayout()
+    if memoryFloatLayer then
+        memoryFloatLayer:set { w = MEMORY_FLOAT_W, h = MEMORY_FLOAT_H, y = MEMORY_FLOAT_Y }
+    end
+    if memoryFloatLabel then
+        memoryFloatLabel:set { x = getCpuFloatLabelX(), w = MEMORY_FLOAT_W, h = MEMORY_FLOAT_H }
+    end
+end
+
+function initMemoryFloatLayer()
+    if memoryFloatLayer and memoryFloatLabel then return true end
+    local ok, disp = pcall(function() return lvgl.disp.get_default() end)
+    if not ok or not disp then return false end
+
+    memoryFloatLayer = lvgl.Object(disp:get_layer_top(), {
+        x = 10,
+        y = MEMORY_FLOAT_Y,
+        w = MEMORY_FLOAT_W,
+        h = MEMORY_FLOAT_H,
+        bg_opa = lvgl.OPA(0),
+        border_width = 0,
+    })
+    memoryFloatLayer:clear_flag(lvgl.FLAG.CLICKABLE)
+    pcall(function() memoryFloatLayer:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
+    memoryFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
+
+    memoryFloatLabel = lvgl.Label(memoryFloatLayer, {
+        x = getCpuFloatLabelX(),
+        y = 0,
+        w = MEMORY_FLOAT_W,
+        h = MEMORY_FLOAT_H,
+        text = memoryLatestText,
+        font_size = 20,
+        font = FONT_24,
+        text_color = '#66ccff',
+        bg_opa = 0,
+    })
+    pcall(function() memoryFloatLabel:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
+    updateMemoryFloatLayout()
+    return true
+end
+
+function updateMemoryFloatLabel()
+    if memoryFloatLabel and memoryFloatEnabled then
+        updateMemoryFloatLayout()
+        memoryFloatLabel:set { text = memoryLatestText }
+    end
+end
+
+function collectMemoryMonitorOnce()
+    local text, pct, raw, stats = readMemoryInfo()
+    stats = stats or {}
+    memoryLatestPercent = pct
+    memoryTotalKb = stats.totalKb or 0
+    memoryUsedKb = stats.usedKb or 0
+    memoryAvailableKb = stats.availableKb or 0
+    memoryFreeKb = stats.freeKb or 0
+    memoryLuaKb = stats.luaKb or 0
+    memoryLatestText = formatMemoryKb(memoryUsedKb) .. '/' .. formatMemoryKb(memoryTotalKb) .. ' ' .. pct .. '%'
+    if not memoryFloatEnabled then
+        appendMemoryMonitorLog(string.format('[%s] %s/%s %d%%', os.date('%H:%M:%S'), formatMemoryKb(memoryUsedKb), formatMemoryKb(memoryTotalKb), pct))
+        if not memoryRawLogged then
+            memoryRawLogged = true
+            local escaped = tostring(raw or 'nil'):gsub('\n', '\\n'):gsub('\r', '\\r')
+            appendMemoryMonitorLog('>>> RAW: [' .. escaped .. ']')
+        end
+    end
+    updateMemoryFloatLabel()
+    writeMemoryMonitorState()
+end
+
+function clearMemoryMonitorLogByTimer()
+    if not memoryMonitorEnabled then return end
+    memoryLogBuffer = {}
+    memoryRawLogged = false
+    writeMemoryMonitorState()
+end
+
+function startMemoryMonitorLogCleaner()
+    if memoryLogClearTimer then
+        memoryLogClearTimer:resume()
+        return
+    end
+    memoryLogClearTimer = lvgl.Timer({ period = MEMORY_MONITOR_LOG_CLEAR_MS, repeat_count = -1,
+        cb = function() clearMemoryMonitorLogByTimer() end })
+    memoryLogClearTimer:resume()
+end
+
+function startMemoryMonitor()
+    if memoryMonitorEnabled then return '检测已开启' end
+    memoryMonitorEnabled = true
+    if not memoryMonitorTimer then
+        memoryMonitorTimer = lvgl.Timer({ period = MEMORY_MONITOR_INTERVAL_MS, repeat_count = -1,
+            cb = function()
+                if memoryMonitorEnabled then collectMemoryMonitorOnce() end
+            end })
+    end
+    memoryMonitorTimer:resume()
+    startMemoryMonitorLogCleaner()
+    appendMemoryMonitorLog('>>> Monitoring Started (800ms interval)')
+    collectMemoryMonitorOnce()
+    writeLuaEventLog('内存检测', '开启检测', '周期: ' .. tostring(MEMORY_MONITOR_INTERVAL_MS) .. 'ms')
+    return '检测已开启'
+end
+
+function stopMemoryMonitor()
+    if not memoryMonitorEnabled then return '检测已停止' end
+    memoryMonitorEnabled = false
+    if memoryMonitorTimer then
+        pcall(function() memoryMonitorTimer:pause() end)
+    end
+    memoryLogBuffer = {}
+    memoryRawLogged = false
+    memoryLatestText = 'MEM:0%'
+    memoryLatestPercent = 0
+    pcall(os.remove, TARGET_DIR .. 'memory_monitor_state.json')
+    pcall(os.remove, TARGET_DIR .. 'memory_monitor_result.json')
+    writeLuaEventLog('内存检测', '关闭检测', '最后数值: ' .. tostring(memoryLatestText))
+    return '检测已停止'
+end
+
+function clearMemoryMonitorLog()
+    memoryLogBuffer = {}
+    memoryRawLogged = false
+    memoryLatestText = 'MEM:0%'
+    memoryLatestPercent = 0
+    updateMemoryFloatLabel()
+    pcall(os.remove, TARGET_DIR .. 'memory_monitor_state.json')
+    pcall(os.remove, TARGET_DIR .. 'memory_monitor_result.json')
+    return '日志已清空'
+end
+
+function showMemoryFloatLayer()
+    if not initMemoryFloatLayer() then
+        pcall(os.remove, TARGET_DIR .. 'memory_monitor_state.json')
+        return '悬浮层创建失败'
+    end
+    local changed = not memoryFloatEnabled
+    memoryFloatEnabled = true
+    memoryFloatLayer:clear_flag(lvgl.FLAG.HIDDEN)
+    memoryLogBuffer = {}
+    memoryRawLogged = false
+    updateMemoryFloatLabel()
+    if changed then
+        writeLuaEventLog('内存悬浮', '开启悬浮', '当前数值: ' .. tostring(memoryLatestText))
+    end
+    return '悬浮已开启'
+end
+
+function hideMemoryFloatLayer()
+    local changed = memoryFloatEnabled == true
+    memoryFloatEnabled = false
+    if memoryFloatLayer then memoryFloatLayer:add_flag(lvgl.FLAG.HIDDEN) end
+    if changed then
+        writeLuaEventLog('内存悬浮', '关闭悬浮', '当前数值: ' .. tostring(memoryLatestText))
+    end
+    return '悬浮已关闭'
+end
+
+function executeMemoryMonitorAction(action)
+    if action == 'monitor_start' then return startMemoryMonitor() end
+    if action == 'monitor_stop' then return stopMemoryMonitor() end
+    if action == 'clear' then return clearMemoryMonitorLog() end
+    if action == 'float_on' then return showMemoryFloatLayer() end
+    if action == 'float_off' then return hideMemoryFloatLayer() end
+    if action == 'status' then
+        if memoryMonitorEnabled then writeMemoryMonitorState() end
+        return '状态已刷新'
+    end
+    return '未知内存操作'
+end
+
+
 -- ====== 应用/缓存管理 IPC ======
 
 CACHE_CLEAN_PATHS = {
@@ -1439,6 +1866,7 @@ local function commandTouchesProtectedIpc(cmd)
         'file_request.json', 'file_result.json',
         'app_manager_request.json', 'app_manager_result.json',
         'cpu_monitor_request.json', 'cpu_monitor_result.json', 'cpu_monitor_state.json',
+        'memory_monitor_request.json', 'memory_monitor_result.json', 'memory_monitor_state.json',
         'bridge_state.json', 'ipc_guard.json',
         'screenshot_history.json', 'screenshot_preview_state.json',
         'screenshot_settings.json',
@@ -2521,6 +2949,37 @@ function readCpuMonitorRequest()
     }
 end
 
+function readMemoryMonitorRequest()
+    local reqFile = TARGET_DIR .. 'memory_monitor_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            return nil
+        end
+    end
+    if not json.seq or not json.action then
+        return nil
+    end
+    if not validateIpcGuard(json, 'memory_monitor_request.json') then
+        return nil
+    end
+    return {
+        seq = json.seq,
+        type = 'memory_monitor',
+        action = json.action,
+        timestamp = json.timestamp
+    }
+end
+
 local function readFileRequest()
     local reqFile = TARGET_DIR .. 'file_request.json'
     if not fileExists(reqFile) then return nil end
@@ -2592,6 +3051,18 @@ function writeCpuMonitorResult(req, status, message)
         timestamp = os.date('%H:%M:%S')
     })
     os.remove(TARGET_DIR .. 'cpu_monitor_request.json')
+end
+
+function writeMemoryMonitorResult(req, status, message)
+    atomicWrite('memory_monitor_result.json', {
+        type = 'memory_monitor_result',
+        seq = req and req.seq or -1,
+        action = req and req.action or '',
+        status = status or 'ok',
+        message = message or '',
+        timestamp = os.date('%H:%M:%S')
+    })
+    os.remove(TARGET_DIR .. 'memory_monitor_request.json')
 end
 
 local function writeFileResult(req, result)
@@ -3034,6 +3505,22 @@ function checkCpuMonitorRequest()
     end
 end
 
+function checkMemoryMonitorRequest()
+    if not isRunning then return end
+
+    local req = readMemoryMonitorRequest()
+    if not req then return end
+
+    local ok, message = pcall(function()
+        return executeMemoryMonitorAction(req.action)
+    end)
+    if ok then
+        writeMemoryMonitorResult(req, 'ok', message or '完成')
+    else
+        writeMemoryMonitorResult(req, 'error', tostring(message or '内存操作失败'))
+    end
+end
+
 local function checkFileRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -3115,6 +3602,8 @@ local function startService()
     pcall(os.execute, 'mkdir -p "' .. SCREENSHOT_DIR .. '"')
     writeBridgeState(false, '', '')
     writeCpuMonitorState()
+    if memoryMonitorEnabled then writeMemoryMonitorState()
+    else pcall(os.remove, TARGET_DIR .. 'memory_monitor_state.json') end
     rotateIpcGuard()
     writeHeartbeat()
     addLog('>>> Service Started')
@@ -3129,6 +3618,7 @@ local function startService()
         cb = function()
             if isRunning then
                 checkCpuMonitorRequest()
+                checkMemoryMonitorRequest()
                 checkAppManagerRequest()
                 checkFileRequest()
                 checkScreenshotRequest()
@@ -3157,8 +3647,12 @@ local function stopService()
     if watchdogTimer then watchdogTimer:pause() end
     if cpuMonitorTimer then cpuMonitorTimer:pause() end
     if cpuLogClearTimer then cpuLogClearTimer:pause() end
+    if memoryMonitorTimer then memoryMonitorTimer:pause() end
+    if memoryLogClearTimer then memoryLogClearTimer:pause() end
     cpuMonitorEnabled = false
     hideCpuFloatLayer()
+    memoryMonitorEnabled = false
+    hideMemoryFloatLayer()
     cmdBusy = false
     busyMode = ''
     screenshotPending = false
