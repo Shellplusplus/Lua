@@ -784,7 +784,7 @@ function initCpuFloatLayer()
     cpuFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
 
     cpuFloatLabel = lvgl.Label(cpuFloatLayer, {
-        x = 8,
+        x = 9,
         y = 0,
         w = CPU_FLOAT_W,
         h = CPU_FLOAT_H,
