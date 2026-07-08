@@ -358,6 +358,27 @@ local function isRedmiWatch6()
         or model == 'm2523w1'
 end
 
+local function getCpuFloatLabelX()
+    local product = string.lower(tostring(activeDeviceProduct or ''))
+    local model = string.lower(tostring(activeDeviceModel or ''))
+    if product == 'redmi watch 6'
+        or product == 'redmi watch6'
+        or product:find('redmi watch 6', 1, true) ~= nil
+        or product:find('redmi watch6', 1, true) ~= nil
+        or model == 'm2523w1' then
+        return 9
+    end
+    if product == 'xiaomi smart band 9 pro'
+        or product:find('xiaomi smart band 9 pro', 1, true) ~= nil then
+        return -16
+    end
+    if product == 'xiaomi smart band 10 pro'
+        or product:find('xiaomi smart band 10 pro', 1, true) ~= nil then
+        return -20
+    end
+    return 9
+end
+
 local function getScreenshotProfile()
     local skipRows = SCREEN_H
     local method = 'legacy'
@@ -667,6 +688,7 @@ local function resolveTargetDirByDeviceInfo()
     activeDeviceProduct = product ~= '' and product or '-'
     activeDeviceModel = tostring(selected.model or '-')
     activeDeviceSourceDir = tostring(selected._sourceDir or chosenDir)
+    if updateCpuFloatLayout then pcall(updateCpuFloatLayout) end
     return true
 end
 
@@ -766,6 +788,15 @@ function writeCpuMonitorState()
     })
 end
 
+function updateCpuFloatLayout()
+    if cpuFloatLayer then
+        cpuFloatLayer:set { w = CPU_FLOAT_W, h = CPU_FLOAT_H }
+    end
+    if cpuFloatLabel then
+        cpuFloatLabel:set { x = getCpuFloatLabelX(), w = CPU_FLOAT_W, h = CPU_FLOAT_H }
+    end
+end
+
 function initCpuFloatLayer()
     if cpuFloatLayer and cpuFloatLabel then return true end
     local ok, disp = pcall(function() return lvgl.disp.get_default() end)
@@ -784,7 +815,7 @@ function initCpuFloatLayer()
     cpuFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
 
     cpuFloatLabel = lvgl.Label(cpuFloatLayer, {
-        x = 9,
+        x = getCpuFloatLabelX(),
         y = 0,
         w = CPU_FLOAT_W,
         h = CPU_FLOAT_H,
@@ -795,11 +826,13 @@ function initCpuFloatLayer()
         bg_opa = 0,
     })
     pcall(function() cpuFloatLabel:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
+    updateCpuFloatLayout()
     return true
 end
 
 function updateCpuFloatLabel()
     if cpuFloatLabel and cpuFloatEnabled then
+        updateCpuFloatLayout()
         cpuFloatLabel:set { text = cpuLatestText }
     end
 end
