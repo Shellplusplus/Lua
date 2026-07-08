@@ -92,6 +92,8 @@ cpuRawLogged = false
 CPU_MONITOR_LOG_LIMIT = 12
 CPU_MONITOR_INTERVAL_MS = 500
 CPU_MONITOR_LOG_CLEAR_MS = 10000
+CPU_FLOAT_W = 150
+CPU_FLOAT_H = 52
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -772,25 +774,27 @@ function initCpuFloatLayer()
     cpuFloatLayer = lvgl.Object(disp:get_layer_top(), {
         x = 10,
         y = 0,
-        w = 120,
-        h = 30,
+        w = CPU_FLOAT_W,
+        h = CPU_FLOAT_H,
         bg_opa = lvgl.OPA(0),
         border_width = 0,
     })
     cpuFloatLayer:clear_flag(lvgl.FLAG.CLICKABLE)
+    pcall(function() cpuFloatLayer:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
     cpuFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
 
     cpuFloatLabel = lvgl.Label(cpuFloatLayer, {
         x = 0,
         y = 0,
-        w = 120,
-        h = 30,
+        w = CPU_FLOAT_W,
+        h = CPU_FLOAT_H,
         text = cpuLatestText,
         font_size = 20,
         font = FONT_24,
         text_color = '#00ff66',
         bg_opa = 0,
     })
+    pcall(function() cpuFloatLabel:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
     return true
 end
 
