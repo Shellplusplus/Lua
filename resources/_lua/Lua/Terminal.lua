@@ -1512,7 +1512,16 @@ function buildCacheItems()
     return items, total
 end
 
+function usesFlatQuickAppRoot()
+    local product = tostring(activeDeviceProduct or '')
+    return product == 'Xiaomi Smart Band 10 Pro'
+        or string.find(product, 'Xiaomi Watch S5', 1, true) ~= nil
+end
+
 function getQuickAppRoot()
+    if usesFlatQuickAppRoot() then
+        return '/data/'
+    end
     if fileExists('/data/quickapp/apps.json') or dirExists('/data/quickapp') then
         return '/data/quickapp/'
     end
@@ -1521,13 +1530,19 @@ end
 
 function getAppManagerPaths()
     local rootPath = getQuickAppRoot()
+    local systemDir = '/data/quickapp/system/'
+    if rootPath == '/data/quickapp/' then
+        systemDir = rootPath .. 'system/'
+    end
     return {
         root = rootPath,
         visibleJson = rootPath .. 'apps.json',
         hiddenJson = rootPath .. 'apps.json_hide',
+        appDir = rootPath .. 'app/',
+        systemDir = systemDir,
         dirs = {
             rootPath .. 'app/',
-            rootPath .. 'system/',
+            systemDir,
             rootPath .. 'cache/',
             rootPath .. 'files/',
             rootPath .. 'mass/'
@@ -1574,7 +1589,7 @@ function appPackage(app)
     return tostring(app and app.package or '')
 end
 
-function appendManagedApp(list, seen, app, hidden)
+function appendManagedApp(list, seen, app, hidden, appDir)
     local packageName = appPackage(app)
     if packageName == '' or seen[packageName] then return end
     seen[packageName] = true
@@ -1584,6 +1599,10 @@ function appendManagedApp(list, seen, app, hidden)
     item.hidden = hidden == true
     item.hideFlag = hidden == true and true or nil
     item.locked = packageIsShellPlusPlus(packageName)
+    if appDir and item.icon then
+        local iconPath = appDir .. packageName .. '/' .. item.icon
+        if fileExists(iconPath) then item.iconPath = iconPath end
+    end
     list[#list + 1] = item
 end
 
@@ -1594,10 +1613,10 @@ function buildManagedApps()
     local apps = {}
     local seen = {}
     for i = 1, #visible.InstalledApps do
-        appendManagedApp(apps, seen, visible.InstalledApps[i], false)
+        appendManagedApp(apps, seen, visible.InstalledApps[i], false, paths.appDir)
     end
     for i = 1, #hidden.InstalledApps do
-        appendManagedApp(apps, seen, hidden.InstalledApps[i], true)
+        appendManagedApp(apps, seen, hidden.InstalledApps[i], true, paths.appDir)
     end
     table.sort(apps, function(a, b) return tostring(a.name or a.package) < tostring(b.name or b.package) end)
     return apps, paths
@@ -1745,6 +1764,46 @@ function appManagerDelete(req)
     }
 end
 
+function getSingleAppSize(packageName)
+    local paths = getAppManagerPaths()
+    local total = 0
+    for i = 1, #paths.dirs do
+        local p = paths.dirs[i] .. packageName .. '/'
+        local ok, dir = pcall(function() return lvgl.fs.open_dir(p) end)
+        if ok and dir then
+            pcall(dir.close, dir)
+            local sz = getFolderSize(p)
+            total = total + (sz or 0)
+        end
+    end
+    return total
+end
+
+function formatAppSize(bytes)
+    bytes = tonumber(bytes) or 0
+    if bytes >= 1024 * 1024 then
+        return string.format('%.1fMB', bytes / (1024 * 1024))
+    elseif bytes >= 1024 then
+        return string.format('%.1fKB', bytes / 1024)
+    end
+    return tostring(bytes) .. 'B'
+end
+
+function appManagerAppSize(req)
+    local packageName = tostring(req and req.package or '')
+    if packageName == '' then
+        return { status = 'error', action = 'app_size', message = '缺少 package 参数' }
+    end
+    local bytes = getSingleAppSize(packageName)
+    return {
+        status = 'ok',
+        action = 'app_size',
+        package = packageName,
+        bytes = bytes,
+        size = formatAppSize(bytes)
+    }
+end
+
 function appManagerReboot(req)
     local ok = pcall(os.execute, 'reboot')
     return {
@@ -1794,6 +1853,7 @@ function executeAppManagerRequest(req)
     if action == 'apps' then return appManagerListResult(action) end
     if action == 'set_visible' then return appManagerSetVisible(req) end
     if action == 'delete' then return appManagerDelete(req) end
+    if action == 'app_size' then return appManagerAppSize(req) end
     if action == 'reboot_system' then return appManagerReboot(req) end
     return { status = 'error', action = action, message = '未知应用管理操作' }
 end
