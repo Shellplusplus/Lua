@@ -33,7 +33,7 @@
 --
 -- @Author        : AzumaChiaki, IKUN-CXKPRO, ziyimiao, ziyimiao5054
 -- @Date          : 2026-06-14 17:21:15
--- @LastEditTime  : 2026-07-07 14:21:05
+-- @LastEditTime  : 2026-07-10 00:18:00
 -- @Project       : Shell++ Lua Backend
 --
 
@@ -44,6 +44,7 @@ local BAND10_PRO_DIR = '/data/data/com.shell.liangyi/'
 local BAND10_PRO_FILES_DIR = '/data/files/com.shell.liangyi/'
 local DEVICE_INFO_FILE = 'device_info.json'
 local SCREENSHOT_DEBUG_FILE = 'screenshot_debug.json'
+local LUA_EXTENSION_SETTINGS_FILE = 'lua_extension_settings.json'
 local TARGET_DIR = BAND10_PRO_DIR
 local CMD_TIMEOUT = 10000  -- 命令超时：10 秒
 local SCREEN_W = lvgl.HOR_RES()
@@ -104,6 +105,10 @@ memoryUsedKb = 0
 memoryAvailableKb = 0
 memoryFreeKb = 0
 memoryLuaKb = 0
+screenshotFloatEnabled = false
+screenshotFloatLayer = nil
+screenshotFloatLabel = nil
+screenshotFloatCaptureTimer = nil
 CPU_MONITOR_LOG_LIMIT = 12
 CPU_MONITOR_INTERVAL_MS = 500
 CPU_MONITOR_LOG_CLEAR_MS = 10000
@@ -115,6 +120,9 @@ MEMORY_MONITOR_LOG_CLEAR_MS = 10000
 MEMORY_FLOAT_W = 150
 MEMORY_FLOAT_H = 52
 MEMORY_FLOAT_Y = CPU_FLOAT_H - 6
+SCREENSHOT_FLOAT_W = 150
+SCREENSHOT_FLOAT_H = 52
+SCREENSHOT_FLOAT_Y = MEMORY_FLOAT_Y + MEMORY_FLOAT_H - 6
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -142,7 +150,7 @@ local UI_TOPBAR_H = 56          -- 顶部返回/标题栏高度（紧凑）
 local HOME_PAD = 20             -- 表盘数据左边距
 
 -- 当前页面与各页面控件引用（切页后重建，故用 forward 局部，配合 nil 守卫）
-local currentPage = 'home'      -- 'home' | 'shell' | 'log'
+local currentPage = 'home'      -- 'home' | 'shell' | 'log' | 'cpu' | 'memory'
 local terminal = nil
 local logTerminal = nil
 local logTapCount = 0
@@ -157,6 +165,11 @@ local spriteCells = nil         -- 像素方块网格（lvgl.Object 数组）
 local spriteFrame = 0
 local clockTimer = nil
 local spriteTimer = nil
+pageRefreshTimer = nil
+monitorStatusLabel = nil
+monitorLogArea = nil
+monitorPageKind = ''
+luaExtensionStatusLabel = nil
 local buildHomePage, buildShellPage, buildLogPage   -- 互相跳转，提前声明
 
 -- 根容器只创建一次；切页时 root:clean() 重建子节点，flag 保留在 root 上
@@ -283,16 +296,14 @@ local function resetLogTap()
 end
 
 local function onLogCardClicked()
-    local now = os.time()
-    if now - logLastTapAt > 2 then
-        logTapCount = 0
+    resetLogTap()
+    if not isLuaExtensionMenuEnabled() then
+        addLog('[menu] lua extension disabled')
+        writeLuaEventLog('Lua扩展菜单', '入口未开启', '请在 QuickApp 设置中打开 Lua扩展菜单')
+        refreshTerminal()
+        return
     end
-    logTapCount = logTapCount + 1
-    logLastTapAt = now
-    if logTapCount >= 2 then
-        resetLogTap()
-        buildLogPage()
-    end
+    buildLogPage()
 end
 
 -- ====== 工具函数 ======
@@ -659,6 +670,13 @@ local function jsonDecode(json)
     return result
 end
 
+local function isLuaExtensionMenuEnabled()
+    local content = readFile(TARGET_DIR .. LUA_EXTENSION_SETTINGS_FILE)
+    if not content or content == '' then return false end
+    local data = jsonDecode(content)
+    return type(data) == 'table' and data.enabled == true
+end
+
 local function readDeviceInfoFrom(dir)
     local content = readFile(dir .. DEVICE_INFO_FILE)
     if not content or content == '' then return nil end
@@ -842,7 +860,7 @@ function initCpuFloatLayer()
         h = CPU_FLOAT_H,
         text = cpuLatestText,
         font_size = 20,
-        font = FONT_24,
+        font = lvgl.BUILTIN_FONT.MONTSERRAT_24,
         text_color = '#00ff66',
         bg_opa = 0,
     })
@@ -1238,7 +1256,7 @@ function initMemoryFloatLayer()
         h = MEMORY_FLOAT_H,
         text = memoryLatestText,
         font_size = 20,
-        font = FONT_24,
+        font = lvgl.BUILTIN_FONT.MONTSERRAT_24,
         text_color = '#66ccff',
         bg_opa = 0,
     })
@@ -1375,6 +1393,101 @@ function executeMemoryMonitorAction(action)
         return '状态已刷新'
     end
     return '未知内存操作'
+end
+
+function writeScreenshotFloatState()
+    atomicWriteJson('screenshot_float_state.json', {
+        type = 'screenshot_float_state',
+        timestamp = tostring(os.time()),
+        floating = screenshotFloatEnabled == true
+    })
+end
+
+function updateScreenshotFloatLayout()
+    if screenshotFloatLayer then
+        screenshotFloatLayer:set { w = SCREENSHOT_FLOAT_W, h = SCREENSHOT_FLOAT_H, y = SCREENSHOT_FLOAT_Y }
+    end
+    if screenshotFloatLabel then
+        screenshotFloatLabel:set { x = getCpuFloatLabelX(), w = SCREENSHOT_FLOAT_W, h = SCREENSHOT_FLOAT_H }
+    end
+end
+
+function initScreenshotFloatLayer()
+    if screenshotFloatLayer and screenshotFloatLabel then return true end
+    local ok, disp = pcall(function() return lvgl.disp.get_default() end)
+    if not ok or not disp then return false end
+
+    screenshotFloatLayer = lvgl.Object(disp:get_layer_top(), {
+        x = 10,
+        y = SCREENSHOT_FLOAT_Y,
+        w = SCREENSHOT_FLOAT_W,
+        h = SCREENSHOT_FLOAT_H,
+        bg_opa = lvgl.OPA(0),
+        border_width = 0,
+    })
+    screenshotFloatLayer:add_flag(lvgl.FLAG.CLICKABLE)
+    pcall(function() screenshotFloatLayer:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
+    screenshotFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
+
+    screenshotFloatLabel = lvgl.Label(screenshotFloatLayer, {
+        x = getCpuFloatLabelX(),
+        y = 0,
+        w = SCREENSHOT_FLOAT_W,
+        h = SCREENSHOT_FLOAT_H,
+        text = 'SHOT',
+        font_size = 20,
+        font = lvgl.BUILTIN_FONT.MONTSERRAT_24,
+        text_color = UI_PRIMARY,
+        bg_opa = 0,
+    })
+    screenshotFloatLabel:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    pcall(function() screenshotFloatLabel:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
+    screenshotFloatLayer:onevent(lvgl.EVENT.CLICKED, function() captureScreenshotFromFloat() end)
+    updateScreenshotFloatLayout()
+    return true
+end
+
+function showScreenshotFloatLayer()
+    if not initScreenshotFloatLayer() then
+        writeScreenshotFloatState()
+        return '悬浮层创建失败'
+    end
+    local changed = not screenshotFloatEnabled
+    screenshotFloatEnabled = true
+    screenshotFloatLayer:clear_flag(lvgl.FLAG.HIDDEN)
+    updateScreenshotFloatLayout()
+    writeScreenshotFloatState()
+    if changed then
+        writeLuaEventLog('截图悬浮', '开启悬浮', '点击悬浮文字可立即截图')
+    end
+    return '悬浮已开启'
+end
+
+function hideScreenshotFloatLayer()
+    local changed = screenshotFloatEnabled == true
+    screenshotFloatEnabled = false
+    if screenshotFloatCaptureTimer then
+        pcall(function() screenshotFloatCaptureTimer:delete() end)
+        screenshotFloatCaptureTimer = nil
+        if busyMode == 'screenshot' then
+            cmdBusy = false
+            busyMode = ''
+            writeBridgeState(false, '', '')
+        end
+    end
+    if screenshotFloatLayer then screenshotFloatLayer:add_flag(lvgl.FLAG.HIDDEN) end
+    writeScreenshotFloatState()
+    if changed then
+        writeLuaEventLog('截图悬浮', '关闭悬浮', '截图悬浮按钮已隐藏')
+    end
+    return '悬浮已关闭'
+end
+
+function executeScreenshotFloatAction(action)
+    if action == 'float_on' then return showScreenshotFloatLayer() end
+    if action == 'float_off' then return hideScreenshotFloatLayer() end
+    if action == 'status' then writeScreenshotFloatState(); return '状态已刷新' end
+    return '未知截图悬浮操作'
 end
 
 
@@ -1927,6 +2040,7 @@ local function commandTouchesProtectedIpc(cmd)
         'app_manager_request.json', 'app_manager_result.json',
         'cpu_monitor_request.json', 'cpu_monitor_result.json', 'cpu_monitor_state.json',
         'memory_monitor_request.json', 'memory_monitor_result.json', 'memory_monitor_state.json',
+        'screenshot_float_request.json', 'screenshot_float_result.json', 'screenshot_float_state.json',
         'bridge_state.json', 'ipc_guard.json',
         'screenshot_history.json', 'screenshot_preview_state.json',
         'screenshot_settings.json',
@@ -3040,6 +3154,37 @@ function readMemoryMonitorRequest()
     }
 end
 
+function readScreenshotFloatRequest()
+    local reqFile = TARGET_DIR .. 'screenshot_float_request.json'
+    if not fileExists(reqFile) then return nil end
+
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then
+            return nil
+        end
+    end
+    if not json.seq or not json.action then
+        return nil
+    end
+    if not validateIpcGuard(json, 'screenshot_float_request.json') then
+        return nil
+    end
+    return {
+        seq = json.seq,
+        type = 'screenshot_float',
+        action = json.action,
+        timestamp = json.timestamp
+    }
+end
+
 local function readFileRequest()
     local reqFile = TARGET_DIR .. 'file_request.json'
     if not fileExists(reqFile) then return nil end
@@ -3125,6 +3270,18 @@ function writeMemoryMonitorResult(req, status, message)
     os.remove(TARGET_DIR .. 'memory_monitor_request.json')
 end
 
+function writeScreenshotFloatResult(req, status, message)
+    atomicWrite('screenshot_float_result.json', {
+        type = 'screenshot_float_result',
+        seq = req and req.seq or -1,
+        action = req and req.action or '',
+        status = status or 'ok',
+        message = message or '',
+        timestamp = os.date('%H:%M:%S')
+    })
+    os.remove(TARGET_DIR .. 'screenshot_float_request.json')
+end
+
 local function writeFileResult(req, result)
     result = result or {}
     result.type = 'file_result'
@@ -3190,6 +3347,67 @@ local function finishScreenshotSuccess(item)
     busyMode = ''
 end
 
+function captureScreenshotFromFloat()
+    if not screenshotFloatEnabled then return end
+    if screenshotFloatCaptureTimer then
+        addLog('[shot] float waiting')
+        return
+    end
+    if cmdBusy then
+        addLog('[shot] float busy')
+        writeLuaEventLog('截图悬浮', '截图被跳过', '当前已有任务执行中')
+        return
+    end
+    if not isRunning then
+        addLog('[shot] service not running')
+        return
+    end
+    localScreenshotSeq = localScreenshotSeq + 1
+    local req = {
+        seq = localScreenshotSeq,
+        type = 'screenshot',
+        timestamp = os.time(),
+        source = 'lua_float_button'
+    }
+    cmdBusy = true
+    busyMode = 'screenshot'
+    if screenshotFloatLayer then
+        screenshotFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
+    end
+    writeBridgeState(true, 'screenshot', '悬浮按钮截图中')
+    writeScreenshotResult({
+        type = 'screenshot_result',
+        seq = req.seq,
+        status = 'capturing',
+        message = '悬浮按钮截图中',
+        timestamp = os.date('%H:%M:%S')
+    })
+    addLog('[shot] hide float before capture')
+    screenshotFloatCaptureTimer = lvgl.Timer({
+        period = 160,
+        repeat_count = 1,
+        cb = function(timer)
+            pcall(function() timer:delete() end)
+            screenshotFloatCaptureTimer = nil
+            addLog('[shot] capture from float button')
+            local item, err = captureScreenshot(req)
+            if item then
+                addLog('[shot] saved #' .. tostring(item.index))
+                finishScreenshotSuccess(item)
+            else
+                addLog('[shot] failed: ' .. tostring(err))
+                finishScreenshotError(err or '截图失败')
+            end
+            if screenshotFloatEnabled and screenshotFloatLayer then
+                updateScreenshotFloatLayout()
+                screenshotFloatLayer:clear_flag(lvgl.FLAG.HIDDEN)
+                writeScreenshotFloatState()
+            end
+        end
+    })
+    screenshotFloatCaptureTimer:resume()
+end
+
 local function prepareScreenshotRequest(req)
     screenshotPending = true
     screenshotReq = req
@@ -3211,14 +3429,15 @@ local function prepareScreenshotRequest(req)
     writeLuaEventLog('截图请求', '等待亮屏', '序号: ' .. tostring(req.seq or -1) .. '\n状态: 请熄屏后重新亮屏')
 end
 
---[[
 local function captureLogPageScreenshot()
     if cmdBusy then
         addLog('[shot] busy')
+        if luaExtensionStatusLabel then luaExtensionStatusLabel:set { text = '当前忙碌，请稍后重试' } end
         return
     end
     if not isRunning then
         addLog('[shot] service not running')
+        if luaExtensionStatusLabel then luaExtensionStatusLabel:set { text = 'Lua 后端未运行' } end
         return
     end
     localScreenshotSeq = localScreenshotSeq + 1
@@ -3228,29 +3447,10 @@ local function captureLogPageScreenshot()
         timestamp = os.time(),
         source = 'lua_log_page'
     }
-    screenshotReq = req
-    screenshotPhase = 'capture_now'
-    cmdBusy = true
-    busyMode = 'screenshot'
-    writeBridgeState(true, 'screenshot', '日志页截图中')
-    writeScreenshotResult({
-        type = 'screenshot_result',
-        seq = req.seq,
-        status = 'capturing',
-        message = '日志页截图中',
-        timestamp = os.date('%H:%M:%S')
-    })
-    addLog('[shot] capture from log page')
-    local item, err = captureScreenshot(req)
-    if item then
-        addLog('[shot] saved #' .. tostring(item.index))
-        finishScreenshotSuccess(item)
-    else
-        addLog('[shot] failed: ' .. tostring(err))
-        finishScreenshotError(err or '截图失败')
-    end
+    addLog('[shot] local request waiting for screen on')
+    if luaExtensionStatusLabel then luaExtensionStatusLabel:set { text = '请熄屏后亮屏' } end
+    prepareScreenshotRequest(req)
 end
-]]
 
 local function normalizeFileManagerPath(path)
     path = tostring(path or '/')
@@ -3582,6 +3782,22 @@ function checkMemoryMonitorRequest()
     end
 end
 
+function checkScreenshotFloatRequest()
+    if not isRunning then return end
+
+    local req = readScreenshotFloatRequest()
+    if not req then return end
+
+    local ok, message = pcall(function()
+        return executeScreenshotFloatAction(req.action)
+    end)
+    if ok then
+        writeScreenshotFloatResult(req, 'ok', message or '完成')
+    else
+        writeScreenshotFloatResult(req, 'error', tostring(message or '截图悬浮操作失败'))
+    end
+end
+
 local function checkFileRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -3692,6 +3908,7 @@ local function startService()
     writeCpuMonitorState()
     if memoryMonitorEnabled then writeMemoryMonitorState()
     else pcall(os.remove, TARGET_DIR .. 'memory_monitor_state.json') end
+    writeScreenshotFloatState()
     rotateIpcGuard()
     writeHeartbeat()
     addLog('>>> Service Started')
@@ -3708,6 +3925,7 @@ local function startService()
                 checkVibrationRequest()
                 checkCpuMonitorRequest()
                 checkMemoryMonitorRequest()
+                checkScreenshotFloatRequest()
                 checkAppManagerRequest()
                 checkFileRequest()
                 checkScreenshotRequest()
@@ -3742,6 +3960,7 @@ local function stopService()
     hideCpuFloatLayer()
     memoryMonitorEnabled = false
     hideMemoryFloatLayer()
+    hideScreenshotFloatLayer()
     cmdBusy = false
     busyMode = ''
     screenshotPending = false
@@ -3760,11 +3979,128 @@ local function clearLog()
     refreshTerminal()
 end
 
+function stopPageRefreshTimer()
+    if pageRefreshTimer then
+        pcall(function() pageRefreshTimer:delete() end)
+        pageRefreshTimer = nil
+    end
+    monitorStatusLabel = nil
+    monitorLogArea = nil
+    monitorPageKind = ''
+    luaExtensionStatusLabel = nil
+end
+
+function makeCardButton(parent, x, y, w, h, title, subtitle, bgColor, cb)
+    local btn = lvgl.Object(parent, {
+        x = x, y = y,
+        w = w, h = h,
+        bg_color = bgColor or UI_CARD,
+        radius = UI_CARD_RADIUS,
+        border_width = 0,
+        pad_all = 0,
+    })
+    btn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    btn:add_flag(lvgl.FLAG.CLICKABLE)
+    local titleY = subtitle and 10 or math.floor((h - 30) / 2)
+    local titleLabel = lvgl.Label(btn, {
+        x = 18, y = titleY,
+        w = w - 36, h = 34,
+        text = title,
+        text_font = lvgl.Font("MiSans-Regular", 26),
+        text_color = UI_TEXT,
+    })
+    titleLabel:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    if subtitle and subtitle ~= '' then
+        local subLabel = lvgl.Label(btn, {
+            x = 18, y = titleY + 34,
+            w = w - 36, h = 28,
+            text = subtitle,
+            text_font = lvgl.Font("MiSans-Regular", 18),
+            text_color = UI_TERM_TEXT,
+        })
+        subLabel:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    end
+    btn:onevent(lvgl.EVENT.CLICKED, cb)
+    return btn
+end
+
+function makeRoundBack(parent, cb)
+    local backDiam = UI_TOPBAR_H - UI_GAP
+    local backBtn = lvgl.Object(parent, {
+        x = UI_GAP, y = UI_GAP,
+        w = backDiam, h = backDiam,
+        bg_color = UI_CARD,
+        radius = math.floor(backDiam / 2),
+        border_width = 0,
+        pad_all = 0,
+    })
+    backBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    backBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    local backLbl = lvgl.Label(backBtn, {
+        align = lvgl.ALIGN.CENTER,
+        text = '<',
+        text_font = lvgl.Font("MiSans-Regular", 32),
+        text_color = UI_TEXT,
+    })
+    backLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    backBtn:onevent(lvgl.EVENT.CLICKED, cb)
+    return backBtn
+end
+
+function monitorLogsToText(kind)
+    local logs = kind == 'memory' and memoryLogBuffer or cpuLogBuffer
+    local text = ''
+    for i = 1, #logs do
+        text = text .. tostring(logs[i]) .. '\n'
+    end
+    if text == '' then
+        text = '暂无日志'
+    end
+    return text
+end
+
+function refreshMonitorPage()
+    if monitorPageKind == 'cpu' then
+        if monitorStatusLabel then
+            monitorStatusLabel:set { text = tostring(cpuLatestText or 'CPU:0%') .. '  ' .. (cpuMonitorEnabled and '检测中' or '已停止') .. '  ' .. (cpuFloatEnabled and '悬浮开' or '悬浮关') }
+        end
+        if monitorLogArea then monitorLogArea:set { text = monitorLogsToText('cpu') } end
+    elseif monitorPageKind == 'memory' then
+        if monitorStatusLabel then
+            monitorStatusLabel:set { text = tostring(memoryLatestText or 'MEM:0%') .. '  ' .. (memoryMonitorEnabled and '检测中' or '已停止') .. '  ' .. (memoryFloatEnabled and '悬浮开' or '悬浮关') }
+        end
+        if monitorLogArea then monitorLogArea:set { text = monitorLogsToText('memory') } end
+    end
+end
+
+function startMonitorPageRefresh(kind)
+    monitorPageKind = kind
+    refreshMonitorPage()
+    pageRefreshTimer = lvgl.Timer({
+        period = 800,
+        repeat_count = -1,
+        cb = function()
+            if currentPage == monitorPageKind then refreshMonitorPage() end
+        end,
+    })
+    pageRefreshTimer:resume()
+end
+
+function runMonitorPageAction(kind, action)
+    if kind == 'cpu' then
+        executeCpuMonitorAction(action)
+    else
+        executeMemoryMonitorAction(action)
+    end
+    refreshMonitorPage()
+end
+
 
 -- ====== 页面构建（单文件多页面，切页用 root:clean() 重建）======
 
 -- home：表盘页。上半屏居中显示时间；下半屏居中随机一只动态精灵，点击进入 shell
 buildHomePage = function()
+    stopPageRefreshTimer()
     currentPage = 'home'
     -- shell 页控件已随 root:clean() 销毁，引用置空以触发各刷新函数的 nil 守卫
     terminal = nil
@@ -3827,6 +4163,7 @@ end
 
 -- shell：终端页。左侧返回按钮、右侧标题 shell++；中部日志卡片；底部 START/STOP、CLEAR
 buildShellPage = function()
+    stopPageRefreshTimer()
     currentPage = 'shell'
     logTerminal = nil
     resetLogTap()
@@ -3931,6 +4268,7 @@ end
 
 -- log：独立日志页。双击 shell 日志卡片进入，支持滚动查看长日志
 buildLogPage = function()
+    stopPageRefreshTimer()
     currentPage = 'log'
     timeLabel = nil
     dateLabel = nil
@@ -3943,97 +4281,95 @@ buildLogPage = function()
     clearBtn = nil
     root:clean()
 
-    local backDiam = UI_TOPBAR_H - UI_GAP
-    local backBtn = lvgl.Object(root, {
-        x = UI_GAP, y = UI_GAP,
-        w = backDiam, h = backDiam,
-        bg_color = UI_CARD,
-        radius = math.floor(backDiam / 2),
-        border_width = 0,
-        pad_all = 0,
-    })
-    backBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
-    backBtn:add_flag(lvgl.FLAG.CLICKABLE)
-    local backLbl = lvgl.Label(backBtn, {
-        align = lvgl.ALIGN.CENTER,
-        text = '<',
-        text_font = lvgl.Font("MiSans-Regular", 32),
-        text_color = UI_TEXT,
-    })
-    backLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
-    backBtn:onevent(lvgl.EVENT.CLICKED, function() buildShellPage() end)
+    makeRoundBack(root, function() buildShellPage() end)
 
     lvgl.Label(root, {
         x = 88, y = 14,
-        text = '日志输出',
+        text = '扩展功能',
         text_font = lvgl.Font("MiSans-Regular", 30),
         text_color = UI_TEXT,
     })
 
---[[
-Shell++ disabled: 按要求注释保留日志二级页截图按钮宽度。
-    local shotW = 116
-]]
-    local clearW = 116
-    local clearH = UI_BTN_H
-    local clearY = SCREEN_H - UI_GAP - clearH
-    logTerminal = lvgl.Textarea(root, {
+    luaExtensionStatusLabel = lvgl.Label(root, {
+        x = UI_GAP, y = UI_TOPBAR_H + 2,
+        w = SCREEN_W - UI_GAP * 2,
+        h = 28,
+        text = '点击截图后按提示操作',
+        text_font = lvgl.Font("MiSans-Regular", 18),
+        text_color = UI_TERM_TEXT,
+    })
+
+    local cardW = SCREEN_W - UI_GAP * 2
+    local cardH = 72
+    local firstY = UI_TOPBAR_H + UI_GAP + 26
+    makeCardButton(root, UI_GAP, firstY, cardW, cardH, '截图', '熄屏后再亮屏保存截图', UI_PRIMARY, function() captureLogPageScreenshot() end)
+    makeCardButton(root, UI_GAP, firstY + cardH + UI_GAP, cardW, cardH, 'CPU占用显示', '检测、悬浮、日志', UI_CARD, function() buildCpuMonitorPage() end)
+    makeCardButton(root, UI_GAP, firstY + (cardH + UI_GAP) * 2, cardW, cardH, '内存占用显示', '检测、悬浮、日志', UI_CARD, function() buildMemoryMonitorPage() end)
+end
+
+function buildMonitorControlPage(kind, title, color)
+    stopPageRefreshTimer()
+    currentPage = kind
+    timeLabel = nil
+    dateLabel = nil
+    weekLabel = nil
+    spriteCells = nil
+    terminal = nil
+    logTerminal = nil
+    startBtn = nil
+    startBtnLabel = nil
+    clearBtn = nil
+    root:clean()
+
+    makeRoundBack(root, function() buildLogPage() end)
+
+    lvgl.Label(root, {
+        x = 88, y = 14,
+        text = title,
+        text_font = lvgl.Font("MiSans-Regular", 30),
+        text_color = UI_TEXT,
+    })
+
+    monitorStatusLabel = lvgl.Label(root, {
         x = UI_GAP, y = UI_TOPBAR_H + UI_GAP,
         w = SCREEN_W - UI_GAP * 2,
-        h = clearY - UI_GAP - (UI_TOPBAR_H + UI_GAP),
+        h = 34,
+        text = '',
+        text_font = lvgl.Font("MiSans-Regular", 20),
+        text_color = color,
+    })
+
+    local btnY = UI_TOPBAR_H + UI_GAP + 40
+    local btnW = math.floor((SCREEN_W - UI_GAP * 3) / 2)
+    local btnH = 48
+    makeCardButton(root, UI_GAP, btnY, btnW, btnH, '开始', nil, UI_PRIMARY, function() runMonitorPageAction(kind, 'monitor_start') end)
+    makeCardButton(root, UI_GAP * 2 + btnW, btnY, btnW, btnH, '停止', nil, UI_DANGER, function() runMonitorPageAction(kind, 'monitor_stop') end)
+    makeCardButton(root, UI_GAP, btnY + btnH + UI_GAP, btnW, btnH, '悬浮开', nil, UI_CARD, function() runMonitorPageAction(kind, 'float_on') end)
+    makeCardButton(root, UI_GAP * 2 + btnW, btnY + btnH + UI_GAP, btnW, btnH, '悬浮关', nil, UI_CARD, function() runMonitorPageAction(kind, 'float_off') end)
+
+    local logY = btnY + (btnH + UI_GAP) * 2
+    monitorLogArea = lvgl.Textarea(root, {
+        x = UI_GAP, y = logY,
+        w = SCREEN_W - UI_GAP * 2,
+        h = SCREEN_H - logY - UI_GAP,
         text = '',
         bg_color = UI_CARD,
         radius = UI_CARD_RADIUS,
-        text_font = lvgl.Font("MiSans-Regular", 20),
+        text_font = lvgl.Font("MiSans-Regular", 18),
         text_color = UI_TERM_TEXT,
         border_width = 0,
         pad_all = 14,
     })
-    logTerminal:add_flag(lvgl.FLAG.SCROLLABLE)
-    logTerminal:add_flag(lvgl.FLAG.CLICKABLE)
+    monitorLogArea:add_flag(lvgl.FLAG.SCROLLABLE)
+    startMonitorPageRefresh(kind)
+end
 
---[[
-    local shotBtnLog = lvgl.Object(root, {
-        x = UI_GAP, y = clearY,
-        w = shotW, h = clearH,
-        bg_color = UI_PRIMARY,
-        radius = UI_BTN_RADIUS,
-        border_width = 0,
-        pad_all = 0,
-    })
-    shotBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
-    shotBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
-    local shotLbl = lvgl.Label(shotBtnLog, {
-        align = lvgl.ALIGN.CENTER,
-        text = '截图',
-        text_font = lvgl.Font("MiSans-Regular", 28),
-        text_color = UI_TEXT,
-    })
-    shotLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
-    shotBtnLog:onevent(lvgl.EVENT.CLICKED, function() captureLogPageScreenshot() end)
+buildCpuMonitorPage = function()
+    buildMonitorControlPage('cpu', 'CPU占用', '#00ff66')
+end
 
-]]
-
-    local clearBtnLog = lvgl.Object(root, {
-        x = SCREEN_W - UI_GAP - clearW, y = clearY,
-        w = clearW, h = clearH,
-        bg_color = UI_CARD,
-        radius = UI_BTN_RADIUS,
-        border_width = 0,
-        pad_all = 0,
-    })
-    clearBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
-    clearBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
-    local clearLbl = lvgl.Label(clearBtnLog, {
-        align = lvgl.ALIGN.CENTER,
-        text = 'CLEAR',
-        text_font = lvgl.Font("MiSans-Regular", 28),
-        text_color = UI_TEXT,
-    })
-    clearLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
-    clearBtnLog:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
-
-    refreshTerminal()
+buildMemoryMonitorPage = function()
+    buildMonitorControlPage('memory', '内存占用', '#66ccff')
 end
 
 -- ====== 启动：动画/时钟定时器（常驻，靠 currentPage 守卫）+ 默认进入表盘 ======
