@@ -123,6 +123,16 @@ MEMORY_FLOAT_Y = CPU_FLOAT_H - 6
 SCREENSHOT_FLOAT_W = 150
 SCREENSHOT_FLOAT_H = 52
 SCREENSHOT_FLOAT_Y = MEMORY_FLOAT_Y + MEMORY_FLOAT_H - 6
+
+-- ====== 传感器数据缓存（只被回调更新，定时器批量写文件） ======
+local sAccelX, sAccelY, sAccelZ = 0, 0, 0
+local sGyroX, sGyroY, sGyroZ = 0, 0, 0
+local sBaroPressure, sBaroAltitude = 0, 0
+local sLightLux, sLightIr = 0, 0
+local sHrate = 0
+local sTemp = 0
+local sHumi = 0
+local sensorWriteTimer = nil
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -3887,13 +3897,44 @@ end
 local function writeHeartbeat()
     local data = {
         type = 'system_info',
-        timestamp = tostring(os.time())
-    }
-    atomicWrite('system_info.json', data)
+
+-- ====== 传感器订阅（回调仅缓存，定时器 5000ms 批量写文件） ======
+
+local function startSensorSubscriptions()
+    pcall(function()
+        local z = {}
+        local ok, sub = pcall(topic.subscribe, "sensor_accel", function(d) d = d or z; sAccelX = d.x or 0; sAccelY = d.y or 0; sAccelZ = d.z or 0 end)
+        if ok and sub then sub = nil end
+        pcall(topic.subscribe, "sensor_gyro",  function(d) d = d or z; sGyroX  = d.x or 0; sGyroY  = d.y or 0; sGyroZ  = d.z or 0 end)
+        pcall(topic.subscribe, "sensor_baro",  function(d) d = d or z; sBaroPressure = d.pressure or 0; sBaroAltitude = d.altitude or 0 end)
+        pcall(topic.subscribe, "sensor_light", function(d) d = d or z; sLightLux = d.light or 0; sLightIr = d.ir or 0 end)
+        pcall(topic.subscribe, "sensor_hrate", function(d) d = d or z; sHrate = d.hrate or 0 end)
+        pcall(topic.subscribe, "sensor_temp",  function(d) d = d or z; sTemp = d.temperature or 0 end)
+        pcall(topic.subscribe, "sensor_humi",  function(d) d = d or z; sHumi = d.humidity or 0 end)
+        sensorWriteTimer = lvgl.Timer({ period = 5000, repeat_count = -1,
+            cb = function()
+                atomicWrite("sensor_accel.json", { x = sAccelX, y = sAccelY, z = sAccelZ })
+                atomicWrite("sensor_gyro.json",  { x = sGyroX,  y = sGyroY,  z = sGyroZ  })
+                atomicWrite("sensor_baro.json",  { pressure = sBaroPressure, altitude = sBaroAltitude })
+                atomicWrite("sensor_light.json", { light = sLightLux, ir = sLightIr })
+                atomicWrite("sensor_hrate.json", { hrate = sHrate })
+                atomicWrite("sensor_temp.json",  { temperature = sTemp })
+                atomicWrite("sensor_humi.json",  { humidity = sHumi })
+            end })
+        sensorWriteTimer:resume()
+        addLog("[sensor] subs ok, write every 5s")
+    end)
 end
+        pcall(topic.subscribe, "sensor_gyro",  gyroCb)
+        pcall(topic.subscribe, "sensor_baro",  baroCb)
+        pcall(topic.subscribe, "sensor_light", lightCb)
+        pcall(topic.subscribe, "sensor_hrate", hrateCb)
+        pcall(topic.subscribe, "sensor_temp",  tempCb)
+        pcall(topic.subscribe, "sensor_humi",  humiCb)
 
--- ====== 启动/停止 ======
-
+        addLog("[sensor] subscribed 5 groups")
+    end)
+end
 local function startService()
     if isRunning then return end
     local ok, msg = resolveTargetDirByDeviceInfo()
@@ -3912,6 +3953,7 @@ local function startService()
     rotateIpcGuard()
     writeHeartbeat()
     addLog('>>> Service Started')
+startSensorSubscriptions()
     writeLuaEventLog('服务启动', 'Terminal Bridge 已启动',
         '设备代号: ' .. activeDeviceProduct
         .. '\n设备型号: ' .. activeDeviceModel
@@ -3956,6 +3998,7 @@ local function stopService()
     if cpuLogClearTimer then cpuLogClearTimer:pause() end
     if memoryMonitorTimer then memoryMonitorTimer:pause() end
     if memoryLogClearTimer then memoryLogClearTimer:pause() end
+    if sensorWriteTimer then sensorWriteTimer:pause() end
     cpuMonitorEnabled = false
     hideCpuFloatLayer()
     memoryMonitorEnabled = false
