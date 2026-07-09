@@ -4241,7 +4241,7 @@ buildShellPage = function()
     })
     terminal:add_flag(lvgl.FLAG.SCROLLABLE)
     terminal:add_flag(lvgl.FLAG.CLICKABLE)
-    terminal:onevent(lvgl.EVENT.CLICKED, function() onLogCardClicked() end)
+    -- terminal:onevent(lvgl.EVENT.CLICKED, function() onLogCardClicked() end)
 
     startBtn = lvgl.Object(root, {
         x = UI_GAP, y = panelY,
