@@ -123,17 +123,6 @@ MEMORY_FLOAT_Y = CPU_FLOAT_H - 6
 SCREENSHOT_FLOAT_W = 150
 SCREENSHOT_FLOAT_H = 52
 SCREENSHOT_FLOAT_Y = MEMORY_FLOAT_Y + MEMORY_FLOAT_H - 6
-
--- ====== 传感器 demo 数据缓存 ======
-local sensorAccelX, sensorAccelY, sensorAccelZ = 0, 0, 0
-local sensorGyroX, sensorGyroY, sensorGyroZ = 0, 0, 0
-local sensorBaroPressure, sensorBaroAltitude = 0, 0
-local sensorLightLux, sensorLightIr = 0, 0
-local sensorHrate = 0
-local sensorTemp = 0
-local sensorHumi = 0
-local sensorLoggerTimer = nil
-local sensorSubs = {}
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -3905,17 +3894,6 @@ end
 
 -- ====== 启动/停止 ======
 
-
--- ====== 传感器 demo 日志输出 ======
-
-local function logSensorData()
-    addLog(string.format("[sensor] accel  x=%.2f y=%.2f z=%.2f", sensorAccelX, sensorAccelY, sensorAccelZ))
-    addLog(string.format("[sensor] gyro   x=%.2f y=%.2f z=%.2f", sensorGyroX, sensorGyroY, sensorGyroZ))
-    addLog(string.format("[sensor] baro   pressure=%.1f hPa  altitude=%.1f m", sensorBaroPressure, sensorBaroAltitude))
-    addLog(string.format("[sensor] light  lux=%.0f  ir=%.0f", sensorLightLux, sensorLightIr))
-    addLog(string.format("[sensor] hrate  %d bpm", sensorHrate))
-    addLog(string.format("[sensor] temp=%.1f C  humi=%.1f%%", sensorTemp, sensorHumi))
-end
 local function startService()
     if isRunning then return end
     local ok, msg = resolveTargetDirByDeviceInfo()
@@ -3964,24 +3942,6 @@ local function startService()
         cb = function() if isRunning then watchdogCheck() end end })
     watchdogTimer:resume()
 
-    -- 传感器 demo：订阅 7 个 topic
-    local function safeSub(name, cb)
-        local ok, sub = pcall(function() return topic.subscribe(name, cb) end)
-        if ok and sub then table.insert(sensorSubs, sub) end
-    end
-    safeSub("sensor_accel",  function(d) sensorAccelX = d.x; sensorAccelY = d.y; sensorAccelZ = d.z end)
-    safeSub("sensor_gyro",   function(d) sensorGyroX  = d.x; sensorGyroY  = d.y; sensorGyroZ  = d.z end)
-    safeSub("sensor_baro",   function(d) sensorBaroPressure = d.pressure; sensorBaroAltitude = d.altitude end)
-    safeSub("sensor_light",  function(d) sensorLightLux = d.light; sensorLightIr = d.ir end)
-    safeSub("sensor_hrate",  function(d) sensorHrate = d.hrate or 0 end)
-    safeSub("sensor_temp",   function(d) sensorTemp = d.temperature or 0 end)
-    safeSub("sensor_humi",   function(d) sensorHumi = d.humidity or 0 end)
-    addLog("[sensor] subscribed " .. #sensorSubs .. " topics")
-
-    sensorLoggerTimer = lvgl.Timer({ period = 5000, repeat_count = -1,
-        cb = function() if isRunning then logSensorData() end end })
-    sensorLoggerTimer:resume()
-
     if startBtn then startBtn:set { bg_color = UI_DANGER } end
     if startBtnLabel then startBtnLabel:set { text = "STOP", text_color = UI_TEXT } end
 end
@@ -3996,9 +3956,6 @@ local function stopService()
     if cpuLogClearTimer then cpuLogClearTimer:pause() end
     if memoryMonitorTimer then memoryMonitorTimer:pause() end
     if memoryLogClearTimer then memoryLogClearTimer:pause() end
-    if sensorLoggerTimer then sensorLoggerTimer:pause() end
-    for _, sub in ipairs(sensorSubs) do pcall(function() sub:unsubscribe() end) end
-    sensorSubs = {}
     cpuMonitorEnabled = false
     hideCpuFloatLayer()
     memoryMonitorEnabled = false
