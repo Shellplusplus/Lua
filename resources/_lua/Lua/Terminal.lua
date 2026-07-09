@@ -3964,23 +3964,25 @@ local function startService()
         cb = function() if isRunning then watchdogCheck() end end })
     watchdogTimer:resume()
 
-    -- 传感器 demo：订阅 7 个 topic
-    local function safeSub(name, cb)
-        local ok, sub = pcall(function() return topic.subscribe(name, cb) end)
-        if ok and sub then table.insert(sensorSubs, sub) end
-    end
-    safeSub("sensor_accel",  function(d) sensorAccelX = d.x; sensorAccelY = d.y; sensorAccelZ = d.z end)
-    safeSub("sensor_gyro",   function(d) sensorGyroX  = d.x; sensorGyroY  = d.y; sensorGyroZ  = d.z end)
-    safeSub("sensor_baro",   function(d) sensorBaroPressure = d.pressure; sensorBaroAltitude = d.altitude end)
-    safeSub("sensor_light",  function(d) sensorLightLux = d.light; sensorLightIr = d.ir end)
-    safeSub("sensor_hrate",  function(d) sensorHrate = d.hrate or 0 end)
-    safeSub("sensor_temp",   function(d) sensorTemp = d.temperature or 0 end)
-    safeSub("sensor_humi",   function(d) sensorHumi = d.humidity or 0 end)
-    addLog("[sensor] subscribed " .. #sensorSubs .. " topics")
-
-    sensorLoggerTimer = lvgl.Timer({ period = 5000, repeat_count = -1,
-        cb = function() if isRunning then logSensorData() end end })
-    sensorLoggerTimer:resume()
+    -- 传感器 demo：用 pcall 包裹全部初始化，避免任何传感器异常导致脚本崩溃
+    pcall(function()
+        local function safeSub(name, cb)
+            local ok, sub = pcall(function() return topic.subscribe(name, cb) end)
+            if ok and sub then table.insert(sensorSubs, sub) end
+        end
+        local d0 = function() return 0 end
+        safeSub("sensor_accel",  function(d) d = d or d0; sensorAccelX = d.x or 0; sensorAccelY = d.y or 0; sensorAccelZ = d.z or 0 end)
+        safeSub("sensor_gyro",   function(d) d = d or d0; sensorGyroX  = d.x or 0; sensorGyroY  = d.y or 0; sensorGyroZ  = d.z or 0 end)
+        safeSub("sensor_baro",   function(d) d = d or d0; sensorBaroPressure = d.pressure or 0; sensorBaroAltitude = d.altitude or 0 end)
+        safeSub("sensor_light",  function(d) d = d or d0; sensorLightLux = d.light or 0; sensorLightIr = d.ir or 0 end)
+        safeSub("sensor_hrate",  function(d) d = d or d0; sensorHrate = d.hrate or 0 end)
+        safeSub("sensor_temp",   function(d) d = d or d0; sensorTemp = d.temperature or 0 end)
+        safeSub("sensor_humi",   function(d) d = d or d0; sensorHumi = d.humidity or 0 end)
+        addLog("[sensor] subscribed " .. #sensorSubs .. " topics")
+        sensorLoggerTimer = lvgl.Timer({ period = 5000, repeat_count = -1,
+            cb = function() if isRunning then logSensorData() end end })
+        sensorLoggerTimer:resume()
+    end)
 
     if startBtn then startBtn:set { bg_color = UI_DANGER } end
     if startBtnLabel then startBtnLabel:set { text = "STOP", text_color = UI_TEXT } end
