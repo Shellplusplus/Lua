@@ -3550,6 +3550,7 @@ function checkAppManagerRequest()
 end
 
 function checkCpuMonitorRequest()
+
     if not isRunning then return end
 
     local req = readCpuMonitorRequest()
@@ -3638,6 +3639,33 @@ local function checkCommandRequest()
     cmdStartTime = nil
 end
 
+-- ====== 振动请求（QuickApp 点击触发） ======
+
+local function checkVibrationRequest()
+    if not isRunning then return end
+    local reqFile = TARGET_DIR .. 'vibration_request.json'
+    if not fileExists(reqFile) then return end
+    local content = readFile(reqFile)
+    if not content or content == '' then return end
+    local json = jsonDecode(content)
+    if not json or type(json.value) ~= 'number' then
+        os.remove(reqFile)
+        return
+    end
+    local v = tonumber(json.value) or -1
+    if v < 0 or v > 14 then
+        os.remove(reqFile)
+        return
+    end
+    pcall(function()
+        if vibrator and type(vibrator.start) == 'function' then
+            vibrator.start(v)
+        end
+    end)
+    os.remove(reqFile)
+    addLog('[vib] vibrator.start(' .. tostring(v) .. ')')
+end
+
 -- ====== 心跳 ======
 
 local function writeHeartbeat()
@@ -3677,6 +3705,7 @@ local function startService()
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
             if isRunning then
+                checkVibrationRequest()
                 checkCpuMonitorRequest()
                 checkMemoryMonitorRequest()
                 checkAppManagerRequest()
