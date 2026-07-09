@@ -124,15 +124,6 @@ SCREENSHOT_FLOAT_W = 150
 SCREENSHOT_FLOAT_H = 52
 SCREENSHOT_FLOAT_Y = MEMORY_FLOAT_Y + MEMORY_FLOAT_H - 6
 
--- ====== 传感器数据缓存（只被回调更新，定时器批量写文件） ======
-local sAccelX, sAccelY, sAccelZ = 0, 0, 0
-local sGyroX, sGyroY, sGyroZ = 0, 0, 0
-local sBaroPressure, sBaroAltitude = 0, 0
-local sLightLux, sLightIr = 0, 0
-local sHrate = 0
-local sTemp = 0
-local sHumi = 0
-local sensorWriteTimer = nil
 local writeLuaEventLog
 
 -- ====== UI ======
@@ -1689,7 +1680,11 @@ end
 
 function saveAppsJson(path, obj)
     obj = normalizeAppsJson(obj)
-    return writeFile(path, jsonEncode(obj))
+    local ok = writeFile(path, jsonEncode(obj))
+    if not ok then
+        addLog('[app] save failed: ' .. tostring(path))
+    end
+    return ok
 end
 
 function cloneAppInfo(app)
@@ -1853,8 +1848,11 @@ function appManagerSetVisible(req)
     else
         moved = moveAppBetweenLists(hidden, visible, packageSet, false)
     end
-    saveAppsJson(paths.visibleJson, visible)
-    saveAppsJson(paths.hiddenJson, hidden)
+    local svOk = saveAppsJson(paths.visibleJson, visible)
+    local shOk = saveAppsJson(paths.hiddenJson, hidden)
+    if not svOk or not shOk then
+        return { status = 'error', action = req.action, message = '保存应用列表失败' }
+    end
     local nextApps = buildManagedApps()
     return {
         status = 'ok',
@@ -1874,8 +1872,11 @@ function appManagerDelete(req)
     local visible = loadAppsJson(paths.visibleJson)
     local hidden = loadAppsJson(paths.hiddenJson)
     local removed = removeAppsFromList(visible, packageSet) + removeAppsFromList(hidden, packageSet)
-    saveAppsJson(paths.visibleJson, visible)
-    saveAppsJson(paths.hiddenJson, hidden)
+    local svOk = saveAppsJson(paths.visibleJson, visible)
+    local shOk = saveAppsJson(paths.hiddenJson, hidden)
+    if not svOk or not shOk then
+        return { status = 'error', action = req.action, message = '保存应用列表失败' }
+    end
     deleteManagedAppFiles(paths, packageSet)
     local nextApps = buildManagedApps()
     return {
@@ -2007,7 +2008,10 @@ local function buildIpcGuardToken()
     return t .. '-' .. r
 end
 
+local prevIpcGuardToken = ''
+
 local function rotateIpcGuard()
+    prevIpcGuardToken = ipcGuardToken
     ipcGuardSeq = ipcGuardSeq + 1
     ipcGuardToken = buildIpcGuardToken()
     atomicWrite('ipc_guard.json', {
@@ -2032,8 +2036,14 @@ end
 
 local function validateIpcGuard(req, filename)
     ensureIpcGuard()
-    if not req or req.guard ~= ipcGuardToken then
-        rejectInjectedRequest(filename, '缺少或错误的安全令牌')
+    if not req then
+        rejectInjectedRequest(filename, '缺少请求数据')
+        return false
+    end
+    local tokenOk = (req.guard == ipcGuardToken) or (req.guard == prevIpcGuardToken and prevIpcGuardToken ~= '')
+    local seqOk = (type(req.guardSeq) == 'number' and req.guardSeq == ipcGuardSeq)
+    if not tokenOk or not seqOk then
+        rejectInjectedRequest(filename, '缺少或错误的安全令牌/序列号')
         return false
     end
     rotateIpcGuard()
@@ -2085,7 +2095,8 @@ local function commandLooksLikeNestedScript(cmd)
         'php ', 'php\t', '/usr/bin/php',
         'nohup ', 'nohup\t', 'setsid ', 'setsid\t',
         'eval ', 'eval\t', 'exec ', 'exec\t',
-        'source ', 'source\t', '. '
+        'source ', 'source\t', '. ',
+        'miwear ', 'miwear\t', '/usr/bin/miwear'
     }
     for i = 1, #prefixes do
         if string.sub(trimmed, 1, #prefixes[i]) == prefixes[i] then
@@ -3098,6 +3109,7 @@ function readAppManagerRequest()
         visible = json.visible,
         all = json.all,
         packages = json.packages,
+        package = json.package,
         timestamp = json.timestamp
     }
 end
@@ -3897,44 +3909,11 @@ end
 local function writeHeartbeat()
     local data = {
         type = 'system_info',
-
--- ====== 传感器订阅（回调仅缓存，定时器 5000ms 批量写文件） ======
-
-local function startSensorSubscriptions()
-    pcall(function()
-        local z = {}
-        local ok, sub = pcall(topic.subscribe, "sensor_accel", function(d) d = d or z; sAccelX = d.x or 0; sAccelY = d.y or 0; sAccelZ = d.z or 0 end)
-        if ok and sub then sub = nil end
-        pcall(topic.subscribe, "sensor_gyro",  function(d) d = d or z; sGyroX  = d.x or 0; sGyroY  = d.y or 0; sGyroZ  = d.z or 0 end)
-        pcall(topic.subscribe, "sensor_baro",  function(d) d = d or z; sBaroPressure = d.pressure or 0; sBaroAltitude = d.altitude or 0 end)
-        pcall(topic.subscribe, "sensor_light", function(d) d = d or z; sLightLux = d.light or 0; sLightIr = d.ir or 0 end)
-        pcall(topic.subscribe, "sensor_hrate", function(d) d = d or z; sHrate = d.hrate or 0 end)
-        pcall(topic.subscribe, "sensor_temp",  function(d) d = d or z; sTemp = d.temperature or 0 end)
-        pcall(topic.subscribe, "sensor_humi",  function(d) d = d or z; sHumi = d.humidity or 0 end)
-        sensorWriteTimer = lvgl.Timer({ period = 5000, repeat_count = -1,
-            cb = function()
-                atomicWrite("sensor_accel.json", { x = sAccelX, y = sAccelY, z = sAccelZ })
-                atomicWrite("sensor_gyro.json",  { x = sGyroX,  y = sGyroY,  z = sGyroZ  })
-                atomicWrite("sensor_baro.json",  { pressure = sBaroPressure, altitude = sBaroAltitude })
-                atomicWrite("sensor_light.json", { light = sLightLux, ir = sLightIr })
-                atomicWrite("sensor_hrate.json", { hrate = sHrate })
-                atomicWrite("sensor_temp.json",  { temperature = sTemp })
-                atomicWrite("sensor_humi.json",  { humidity = sHumi })
-            end })
-        sensorWriteTimer:resume()
-        addLog("[sensor] subs ok, write every 5s")
-    end)
+        timestamp = tostring(os.time())
+    }
+    atomicWrite('system_info.json', data)
 end
-        pcall(topic.subscribe, "sensor_gyro",  gyroCb)
-        pcall(topic.subscribe, "sensor_baro",  baroCb)
-        pcall(topic.subscribe, "sensor_light", lightCb)
-        pcall(topic.subscribe, "sensor_hrate", hrateCb)
-        pcall(topic.subscribe, "sensor_temp",  tempCb)
-        pcall(topic.subscribe, "sensor_humi",  humiCb)
 
-        addLog("[sensor] subscribed 5 groups")
-    end)
-end
 local function startService()
     if isRunning then return end
     local ok, msg = resolveTargetDirByDeviceInfo()
@@ -3953,7 +3932,6 @@ local function startService()
     rotateIpcGuard()
     writeHeartbeat()
     addLog('>>> Service Started')
-startSensorSubscriptions()
     writeLuaEventLog('服务启动', 'Terminal Bridge 已启动',
         '设备代号: ' .. activeDeviceProduct
         .. '\n设备型号: ' .. activeDeviceModel
@@ -3998,7 +3976,6 @@ local function stopService()
     if cpuLogClearTimer then cpuLogClearTimer:pause() end
     if memoryMonitorTimer then memoryMonitorTimer:pause() end
     if memoryLogClearTimer then memoryLogClearTimer:pause() end
-    if sensorWriteTimer then sensorWriteTimer:pause() end
     cpuMonitorEnabled = false
     hideCpuFloatLayer()
     memoryMonitorEnabled = false
