@@ -3918,11 +3918,13 @@ local function checkMcuBenchRequest()
     addLog('[bench] ' .. tostring(ops) .. ' ops/s, ' .. tostring(math.floor(elapsed * 1000)) .. 'ms')
 end
 
--- ====== 心跳 ======
 
 local function writeHeartbeat()
     local data = {
-    end)
+        type = 'system_info',
+        timestamp = tostring(os.time())
+    }
+    atomicWrite('system_info.json', data)
 end
 local function startService()
     if isRunning then return end
