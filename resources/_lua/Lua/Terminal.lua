@@ -1269,6 +1269,7 @@ function initMemoryFloatLayer()
 end
 
 function updateMemoryFloatLabel()
+    writeMemoryMonitorState()
     if memoryFloatLabel and memoryFloatEnabled then
         updateMemoryFloatLayout()
         memoryFloatLabel:set { text = memoryLatestText }
@@ -1294,6 +1295,7 @@ function collectMemoryMonitorOnce()
         end
     end
     updateMemoryFloatLabel()
+    writeMemoryMonitorState()
     writeMemoryMonitorState()
 end
 
@@ -1353,6 +1355,7 @@ function clearMemoryMonitorLog()
     memoryLatestText = 'MEM:0%'
     memoryLatestPercent = 0
     updateMemoryFloatLabel()
+    writeMemoryMonitorState()
     pcall(os.remove, TARGET_DIR .. 'memory_monitor_state.json')
     pcall(os.remove, TARGET_DIR .. 'memory_monitor_result.json')
     return '日志已清空'
@@ -1369,6 +1372,7 @@ function showMemoryFloatLayer()
     memoryLogBuffer = {}
     memoryRawLogged = false
     updateMemoryFloatLabel()
+    writeMemoryMonitorState()
     if changed then
         writeLuaEventLog('内存悬浮', '开启悬浮', '当前数值: ' .. tostring(memoryLatestText))
     end
@@ -1381,6 +1385,7 @@ function hideMemoryFloatLayer()
     if memoryFloatLayer then memoryFloatLayer:add_flag(lvgl.FLAG.HIDDEN) end
     if changed then
         writeLuaEventLog('内存悬浮', '关闭悬浮', '当前数值: ' .. tostring(memoryLatestText))
+    writeMemoryMonitorState()
     end
     return '悬浮已关闭'
 end
