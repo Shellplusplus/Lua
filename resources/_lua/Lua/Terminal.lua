@@ -3858,7 +3858,8 @@ end
 
 -- ====== 振动请求（QuickApp 点击触发） ======
 
-local function checkVibrationRequest()
+local function checkMcuBenchRequest()
+                checkVibrationRequest()
     if not isRunning then return end
     local reqFile = TARGET_DIR .. 'vibration_request.json'
     if not fileExists(reqFile) then return end
@@ -3881,6 +3882,40 @@ local function checkVibrationRequest()
     end)
     os.remove(reqFile)
     addLog('[vib] vibrator.start(' .. tostring(v) .. ')')
+end
+
+-- ====== MCU 算力检测（QuickApp 触发） ======
+
+local function checkMcuBenchRequest()
+    if not isRunning then return end
+    local reqFile = TARGET_DIR .. 'mcu_bench_request.json'
+    if not fileExists(reqFile) then return end
+    local content = readFile(reqFile)
+    if not content or content == '' then return end
+    local json = jsonDecode(content)
+    if not json or json.action ~= 'start' then
+        os.remove(reqFile)
+        return
+    end
+    local loops = tonumber(json.loops) or 30000
+    if loops < 1000 then loops = 1000 end
+    if loops > 200000 then loops = 200000 end
+    addLog('[bench] Lua MCU test: ' .. tostring(loops) .. ' loops')
+    local start = os.clock()
+    local x = 1.5
+    for i = 1, loops do
+        x = math.sqrt(x * 1.0001 + 0.5)
+    end
+    local elapsed = os.clock() - start
+    local ops = math.floor(loops / elapsed)
+    atomicWrite('mcu_bench_result.json', {
+        loops = loops,
+        ops_per_sec = ops,
+        elapsed_ms = math.floor(elapsed * 1000),
+        volatile = string.format('%.2f', x)
+    })
+    os.remove(reqFile)
+    addLog('[bench] ' .. tostring(ops) .. ' ops/s, ' .. tostring(math.floor(elapsed * 1000)) .. 'ms')
 end
 
 -- ====== 心跳 ======
@@ -3917,6 +3952,7 @@ local function startService()
     cmdTimer = lvgl.Timer({ period = 500, repeat_count = -1,
         cb = function()
             if isRunning then
+                checkMcuBenchRequest()
                 checkVibrationRequest()
                 checkCpuMonitorRequest()
                 checkMemoryMonitorRequest()
