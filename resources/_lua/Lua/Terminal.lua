@@ -109,6 +109,12 @@ screenshotFloatEnabled = false
 screenshotFloatLayer = nil
 screenshotFloatLabel = nil
 screenshotFloatCaptureTimer = nil
+screenshotFloatDragging = false
+screenshotFloatDragMoved = false
+screenshotFloatDragStartX = 0
+screenshotFloatDragStartY = 0
+screenshotFloatDragOriginX = 0
+screenshotFloatDragOriginY = 0
 CPU_MONITOR_LOG_LIMIT = 12
 CPU_MONITOR_INTERVAL_MS = 500
 CPU_MONITOR_LOG_CLEAR_MS = 10000
@@ -123,6 +129,9 @@ MEMORY_FLOAT_Y = CPU_FLOAT_H - 6
 SCREENSHOT_FLOAT_W = 150
 SCREENSHOT_FLOAT_H = 52
 SCREENSHOT_FLOAT_Y = MEMORY_FLOAT_Y + MEMORY_FLOAT_H - 6
+SCREENSHOT_FLOAT_X = 10
+screenshotFloatX = SCREENSHOT_FLOAT_X
+screenshotFloatY = SCREENSHOT_FLOAT_Y
 
 local writeLuaEventLog
 
@@ -1400,16 +1409,42 @@ function writeScreenshotFloatState()
     atomicWriteJson('screenshot_float_state.json', {
         type = 'screenshot_float_state',
         timestamp = tostring(os.time()),
-        floating = screenshotFloatEnabled == true
+        floating = screenshotFloatEnabled == true,
+        x = screenshotFloatX,
+        y = screenshotFloatY
     })
+end
+
+local function clampScreenshotFloatPosition(x, y)
+    local maxX = math.max(0, SCREEN_W - SCREENSHOT_FLOAT_W)
+    local maxY = math.max(0, SCREEN_H - SCREENSHOT_FLOAT_H)
+    x = math.floor(tonumber(x) or SCREENSHOT_FLOAT_X)
+    y = math.floor(tonumber(y) or SCREENSHOT_FLOAT_Y)
+    if x < 0 then x = 0 end
+    if y < 0 then y = 0 end
+    if x > maxX then x = maxX end
+    if y > maxY then y = maxY end
+    return x, y
+end
+
+local function loadScreenshotFloatPosition()
+    local content = readFile(TARGET_DIR .. 'screenshot_float_state.json')
+    local saved = content and jsonDecode(content) or nil
+    if type(saved) ~= 'table' then return end
+    screenshotFloatX, screenshotFloatY = clampScreenshotFloatPosition(saved.x, saved.y)
 end
 
 function updateScreenshotFloatLayout()
     if screenshotFloatLayer then
-        screenshotFloatLayer:set { w = SCREENSHOT_FLOAT_W, h = SCREENSHOT_FLOAT_H, y = SCREENSHOT_FLOAT_Y }
+        screenshotFloatLayer:set {
+            x = screenshotFloatX,
+            y = screenshotFloatY,
+            w = SCREENSHOT_FLOAT_W,
+            h = SCREENSHOT_FLOAT_H
+        }
     end
     if screenshotFloatLabel then
-        screenshotFloatLabel:set { x = getCpuFloatLabelX(), w = SCREENSHOT_FLOAT_W, h = SCREENSHOT_FLOAT_H }
+        screenshotFloatLabel:set { x = 0, w = SCREENSHOT_FLOAT_W, h = SCREENSHOT_FLOAT_H }
     end
 end
 
@@ -1419,31 +1454,87 @@ function initScreenshotFloatLayer()
     if not ok or not disp then return false end
 
     screenshotFloatLayer = lvgl.Object(disp:get_layer_top(), {
-        x = 10,
-        y = SCREENSHOT_FLOAT_Y,
+        x = screenshotFloatX,
+        y = screenshotFloatY,
         w = SCREENSHOT_FLOAT_W,
         h = SCREENSHOT_FLOAT_H,
-        bg_opa = lvgl.OPA(0),
-        border_width = 0,
+        bg_color = UI_PRIMARY,
+        bg_opa = lvgl.OPA(165),
+        border_width = 2,
+        border_color = UI_TERM_TEXT,
+        radius = lvgl.RADIUS_CIRCLE,
+        pad_all = 0,
     })
     screenshotFloatLayer:add_flag(lvgl.FLAG.CLICKABLE)
     pcall(function() screenshotFloatLayer:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
     screenshotFloatLayer:add_flag(lvgl.FLAG.HIDDEN)
 
     screenshotFloatLabel = lvgl.Label(screenshotFloatLayer, {
-        x = getCpuFloatLabelX(),
+        x = 0,
         y = 0,
         w = SCREENSHOT_FLOAT_W,
         h = SCREENSHOT_FLOAT_H,
         text = 'SHOT',
         font_size = 20,
         font = lvgl.BUILTIN_FONT.MONTSERRAT_24,
-        text_color = UI_PRIMARY,
+        text_color = UI_TEXT,
         bg_opa = 0,
+        align = lvgl.ALIGN.CENTER,
     })
     screenshotFloatLabel:add_flag(lvgl.FLAG.EVENT_BUBBLE)
     pcall(function() screenshotFloatLabel:add_flag(lvgl.FLAG.OVERFLOW_VISIBLE) end)
-    screenshotFloatLayer:onevent(lvgl.EVENT.CLICKED, function() captureScreenshotFromFloat() end)
+    screenshotFloatLayer:onevent(lvgl.EVENT.PRESSED, function()
+        local ok, indev = pcall(lvgl.indev.get_act)
+        if not ok or not indev then return end
+        local pointOk, point, pointY = pcall(function() return indev:get_point() end)
+        if not pointOk then return end
+        local x = type(point) == 'table' and (point.x or point[1]) or point
+        local y = type(point) == 'table' and (point.y or point[2]) or pointY
+        if tonumber(x) == nil or tonumber(y) == nil then return end
+        screenshotFloatDragging = true
+        screenshotFloatDragMoved = false
+        screenshotFloatDragStartX = tonumber(x)
+        screenshotFloatDragStartY = tonumber(y)
+        screenshotFloatDragOriginX = screenshotFloatX
+        screenshotFloatDragOriginY = screenshotFloatY
+    end)
+    screenshotFloatLayer:onevent(lvgl.EVENT.PRESSING, function()
+        if not screenshotFloatDragging then return end
+        local ok, indev = pcall(lvgl.indev.get_act)
+        if not ok or not indev then return end
+        local pointOk, point, pointY = pcall(function() return indev:get_point() end)
+        if not pointOk then return end
+        local x = type(point) == 'table' and (point.x or point[1]) or point
+        local y = type(point) == 'table' and (point.y or point[2]) or pointY
+        x = tonumber(x)
+        y = tonumber(y)
+        if not x or not y then return end
+        local dx = x - screenshotFloatDragStartX
+        local dy = y - screenshotFloatDragStartY
+        if math.abs(dx) > 5 or math.abs(dy) > 5 then
+            screenshotFloatDragMoved = true
+        end
+        screenshotFloatX, screenshotFloatY = clampScreenshotFloatPosition(
+            screenshotFloatDragOriginX + dx,
+            screenshotFloatDragOriginY + dy
+        )
+        updateScreenshotFloatLayout()
+    end)
+    local function endScreenshotFloatDrag()
+        if screenshotFloatDragging and screenshotFloatDragMoved then
+            writeScreenshotFloatState()
+        end
+        screenshotFloatDragging = false
+    end
+    screenshotFloatLayer:onevent(lvgl.EVENT.RELEASED, endScreenshotFloatDrag)
+    screenshotFloatLayer:onevent(lvgl.EVENT.PRESS_LOST, endScreenshotFloatDrag)
+    screenshotFloatLayer:onevent(lvgl.EVENT.CLICKED, function()
+        if screenshotFloatDragMoved then
+            screenshotFloatDragMoved = false
+            return
+        end
+        captureScreenshotFromFloat()
+    end)
     updateScreenshotFloatLayout()
     return true
 end
