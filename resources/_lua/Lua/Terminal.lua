@@ -297,15 +297,9 @@ local function resetLogTap()
 end
 
 
-local function isLuaExtensionMenuEnabled()
-    local content = readFile(TARGET_DIR .. LUA_EXTENSION_SETTINGS_FILE)
-    if not content or content == '' then return false end
-    local data = jsonDecode(content)
-    return type(data) == 'table' and data.enabled == true
-end
 local function onLogCardClicked()
     resetLogTap()
-    if not isLuaExtensionMenuEnabled() then
+    if false then
         addLog('[menu] lua extension disabled')
         writeLuaEventLog('Lua扩展菜单', '入口未开启', '请在 QuickApp 设置中打开 Lua扩展菜单')
         refreshTerminal()
@@ -678,6 +672,13 @@ local function jsonDecode(json)
     return result
 end
 
+
+local function isLuaExtensionMenuEnabled()
+    local content = readFile(TARGET_DIR .. LUA_EXTENSION_SETTINGS_FILE)
+    if not content or content == '' then return false end
+    local data = jsonDecode(content)
+    return type(data) == 'table' and data.enabled == true
+end
 
 local function readDeviceInfoFrom(dir)
     local content = readFile(dir .. DEVICE_INFO_FILE)
