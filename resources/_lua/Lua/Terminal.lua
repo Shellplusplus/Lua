@@ -3858,8 +3858,7 @@ end
 
 -- ====== 振动请求（QuickApp 点击触发） ======
 
-local function checkMcuBenchRequest()
-                checkVibrationRequest()
+local function checkVibrationRequest()
     if not isRunning then return end
     local reqFile = TARGET_DIR .. 'vibration_request.json'
     if not fileExists(reqFile) then return end
