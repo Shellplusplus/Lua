@@ -296,6 +296,13 @@ local function resetLogTap()
     logLastTapAt = 0
 end
 
+
+local function isLuaExtensionMenuEnabled()
+    local content = readFile(TARGET_DIR .. LUA_EXTENSION_SETTINGS_FILE)
+    if not content or content == '' then return false end
+    local data = jsonDecode(content)
+    return type(data) == 'table' and data.enabled == true
+end
 local function onLogCardClicked()
     resetLogTap()
     if not isLuaExtensionMenuEnabled() then
@@ -671,12 +678,6 @@ local function jsonDecode(json)
     return result
 end
 
-local function isLuaExtensionMenuEnabled()
-    local content = readFile(TARGET_DIR .. LUA_EXTENSION_SETTINGS_FILE)
-    if not content or content == '' then return false end
-    local data = jsonDecode(content)
-    return type(data) == 'table' and data.enabled == true
-end
 
 local function readDeviceInfoFrom(dir)
     local content = readFile(dir .. DEVICE_INFO_FILE)
