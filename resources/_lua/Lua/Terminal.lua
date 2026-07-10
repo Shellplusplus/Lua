@@ -4314,31 +4314,54 @@ buildLogPage = function()
     startBtnLabel = nil
     clearBtn = nil
     root:clean()
---
---    makeRoundBack(root, function() buildShellPage() end)
---
---    lvgl.Label(root, {
---        x = 88, y = 14,
---        text = '扩展功能',
---        text_font = lvgl.Font("MiSans-Regular", 30),
---        text_color = UI_TEXT,
---    })
---
---    luaExtensionStatusLabel = lvgl.Label(root, {
---        x = UI_GAP, y = UI_TOPBAR_H + 2,
---        w = SCREEN_W - UI_GAP * 2,
---        h = 28,
---        text = '点击截图后按提示操作',
---        text_font = lvgl.Font("MiSans-Regular", 18),
---        text_color = UI_TERM_TEXT,
---    })
---
---    local cardW = SCREEN_W - UI_GAP * 2
---    local cardH = 72
---    local firstY = UI_TOPBAR_H + UI_GAP + 26
---    makeCardButton(root, UI_GAP, firstY, cardW, cardH, '截图', '熄屏后再亮屏保存截图', UI_PRIMARY, function() captureLogPageScreenshot() end)
---    makeCardButton(root, UI_GAP, firstY + cardH + UI_GAP, cardW, cardH, 'CPU占用显示', '检测、悬浮、日志', UI_CARD, function() buildCpuMonitorPage() end)
---    makeCardButton(root, UI_GAP, firstY + (cardH + UI_GAP) * 2, cardW, cardH, '内存占用显示', '检测、悬浮、日志', UI_CARD, function() buildMemoryMonitorPage() end)
+
+    makeRoundBack(root, function() buildShellPage() end)
+
+    lvgl.Label(root, {
+        x = 88, y = 14,
+        text = '日志输出',
+        text_font = lvgl.Font("MiSans-Regular", 30),
+        text_color = UI_TEXT,
+    })
+
+    local clearW = 116
+    local clearH = UI_BTN_H
+    local clearY = SCREEN_H - UI_GAP - clearH
+    logTerminal = lvgl.Textarea(root, {
+        x = UI_GAP, y = UI_TOPBAR_H + UI_GAP,
+        w = SCREEN_W - UI_GAP * 2,
+        h = clearY - UI_GAP - (UI_TOPBAR_H + UI_GAP),
+        text = '',
+        bg_color = UI_CARD,
+        radius = UI_CARD_RADIUS,
+        text_font = lvgl.Font("MiSans-Regular", 20),
+        text_color = UI_TERM_TEXT,
+        border_width = 0,
+        pad_all = 14,
+    })
+    logTerminal:add_flag(lvgl.FLAG.SCROLLABLE)
+    logTerminal:add_flag(lvgl.FLAG.CLICKABLE)
+
+    local clearBtnLog = lvgl.Object(root, {
+        x = SCREEN_W - UI_GAP - clearW, y = clearY,
+        w = clearW, h = clearH,
+        bg_color = UI_CARD,
+        radius = UI_BTN_RADIUS,
+        border_width = 0,
+        pad_all = 0,
+    })
+    clearBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
+    clearBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
+    local clearLbl = lvgl.Label(clearBtnLog, {
+        align = lvgl.ALIGN.CENTER,
+        text = 'CLEAR',
+        text_font = lvgl.Font("MiSans-Regular", 28),
+        text_color = UI_TEXT,
+    })
+    clearLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    clearBtnLog:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
+
+    refreshTerminal()
 end
 
 function buildMonitorControlPage(kind, title, color)
