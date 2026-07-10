@@ -33,7 +33,7 @@
 --
 -- @Author        : AzumaChiaki, IKUN-CXKPRO, ziyimiao, ziyimiao5054
 -- @Date          : 2026-06-14 17:21:15
--- @LastEditTime  : 2026-07-10 00:18:00
+-- @LastEditTime  : 2026-07-10 16:08:25
 -- @Project       : Shell++ Lua Backend
 --
 
@@ -126,8 +126,8 @@ MEMORY_MONITOR_LOG_CLEAR_MS = 10000
 MEMORY_FLOAT_W = 150
 MEMORY_FLOAT_H = 52
 MEMORY_FLOAT_Y = CPU_FLOAT_H - 6
-SCREENSHOT_FLOAT_W = 150
-SCREENSHOT_FLOAT_H = 52
+SCREENSHOT_FLOAT_W = 90
+SCREENSHOT_FLOAT_H = 32
 SCREENSHOT_FLOAT_Y = MEMORY_FLOAT_Y + MEMORY_FLOAT_H - 6
 SCREENSHOT_FLOAT_X = 10
 screenshotFloatX = SCREENSHOT_FLOAT_X
@@ -305,6 +305,7 @@ local function resetLogTap()
     logLastTapAt = 0
 end
 
+--[[
 local function onLogCardClicked()
     resetLogTap()
     if not isLuaExtensionMenuEnabled() then
@@ -315,6 +316,7 @@ local function onLogCardClicked()
     end
     buildLogPage()
 end
+--]]
 
 -- ====== 工具函数 ======
 
@@ -1458,11 +1460,9 @@ function initScreenshotFloatLayer()
         y = screenshotFloatY,
         w = SCREENSHOT_FLOAT_W,
         h = SCREENSHOT_FLOAT_H,
-        bg_color = UI_PRIMARY,
-        bg_opa = lvgl.OPA(165),
-        border_width = 2,
-        border_color = UI_TERM_TEXT,
-        radius = lvgl.RADIUS_CIRCLE,
+        bg_opa = lvgl.OPA(0),
+        border_width = 0,
+        radius = 0,
         pad_all = 0,
     })
     screenshotFloatLayer:add_flag(lvgl.FLAG.CLICKABLE)
@@ -1475,7 +1475,7 @@ function initScreenshotFloatLayer()
         w = SCREENSHOT_FLOAT_W,
         h = SCREENSHOT_FLOAT_H,
         text = 'SHOT',
-        font_size = 20,
+        font_size = 18,
         font = lvgl.BUILTIN_FONT.MONTSERRAT_24,
         text_color = UI_TEXT,
         bg_opa = 0,
@@ -3439,6 +3439,60 @@ local function finishScreenshotSuccess(item)
     busyMode = ''
 end
 
+local function screenshotFloatIsHidden()
+    if not screenshotFloatLayer then return false end
+    local ok, visible = pcall(function() return screenshotFloatLayer:is_visible() end)
+    return ok and visible == false
+end
+
+local function restoreScreenshotFloatAfterCapture()
+    if screenshotFloatEnabled and screenshotFloatLayer then
+        updateScreenshotFloatLayout()
+        screenshotFloatLayer:clear_flag(lvgl.FLAG.HIDDEN)
+        writeScreenshotFloatState()
+    end
+end
+
+local function captureScreenshotAfterHidden(req, attempt)
+    if not screenshotFloatEnabled then return end
+    if not screenshotFloatIsHidden() then
+        if attempt >= 15 then
+            addLog('[shot] hide confirmation timeout')
+            finishScreenshotError('SHOT 隐藏确认失败')
+            restoreScreenshotFloatAfterCapture()
+            screenshotFloatCaptureTimer = nil
+            return
+        end
+        screenshotFloatCaptureTimer = lvgl.Timer({
+            period = 32,
+            repeat_count = 1,
+            cb = function(timer)
+                pcall(function() timer:delete() end)
+                screenshotFloatCaptureTimer = nil
+                captureScreenshotAfterHidden(req, attempt + 1)
+            end
+        })
+        screenshotFloatCaptureTimer:resume()
+        return
+    end
+
+    addLog('[shot] hide confirmed, capture now')
+    local captureOk, item, err = pcall(captureScreenshot, req)
+    if not captureOk then
+        err = item
+        item = nil
+    end
+    if item then
+        addLog('[shot] saved #' .. tostring(item.index))
+        finishScreenshotSuccess(item)
+    else
+        addLog('[shot] failed: ' .. tostring(err))
+        finishScreenshotError(err or '截图失败')
+    end
+    screenshotFloatCaptureTimer = nil
+    restoreScreenshotFloatAfterCapture()
+end
+
 function captureScreenshotFromFloat()
     if not screenshotFloatEnabled then return end
     if screenshotFloatCaptureTimer then
@@ -3476,25 +3530,12 @@ function captureScreenshotFromFloat()
     })
     addLog('[shot] hide float before capture')
     screenshotFloatCaptureTimer = lvgl.Timer({
-        period = 160,
+        period = 32,
         repeat_count = 1,
         cb = function(timer)
             pcall(function() timer:delete() end)
             screenshotFloatCaptureTimer = nil
-            addLog('[shot] capture from float button')
-            local item, err = captureScreenshot(req)
-            if item then
-                addLog('[shot] saved #' .. tostring(item.index))
-                finishScreenshotSuccess(item)
-            else
-                addLog('[shot] failed: ' .. tostring(err))
-                finishScreenshotError(err or '截图失败')
-            end
-            if screenshotFloatEnabled and screenshotFloatLayer then
-                updateScreenshotFloatLayout()
-                screenshotFloatLayer:clear_flag(lvgl.FLAG.HIDDEN)
-                writeScreenshotFloatState()
-            end
+            captureScreenshotAfterHidden(req, 0)
         end
     })
     screenshotFloatCaptureTimer:resume()
@@ -4344,7 +4385,7 @@ buildShellPage = function()
     })
     terminal:add_flag(lvgl.FLAG.SCROLLABLE)
     terminal:add_flag(lvgl.FLAG.CLICKABLE)
-    terminal:onevent(lvgl.EVENT.CLICKED, function() onLogCardClicked() end)
+    -- terminal:onevent(lvgl.EVENT.CLICKED, function() onLogCardClicked() end)
 
     startBtn = lvgl.Object(root, {
         x = UI_GAP, y = panelY,
@@ -4516,6 +4557,7 @@ do
     if not ok and msg then
         addLog(msg)
     end
+    loadScreenshotFloatPosition()
 end
 
 buildHomePage()
