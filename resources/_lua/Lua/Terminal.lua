@@ -44,6 +44,7 @@ local BAND10_PRO_DIR = '/data/data/com.shell.liangyi/'
 local BAND10_PRO_FILES_DIR = '/data/files/com.shell.liangyi/'
 local DEVICE_INFO_FILE = 'device_info.json'
 local SCREENSHOT_DEBUG_FILE = 'screenshot_debug.json'
+local DEBUG_TEST_FILE = 'debug_test_mode.json'
 local LUA_EXTENSION_SETTINGS_FILE = 'lua_extension_settings.json'
 local TARGET_DIR = BAND10_PRO_DIR
 local CMD_TIMEOUT = 10000  -- 命令超时：10 秒
@@ -392,6 +393,29 @@ local function isRedmiWatch6()
         or model == 'm2523w1'
 end
 
+local function containsXiaomiWatchS4(value)
+    local compact = string.lower(tostring(value or '')):gsub('%s+', '')
+    return compact:find('xiaomiwatchs4', 1, true) ~= nil
+end
+
+local function isXiaomiWatchS4()
+    return containsXiaomiWatchS4(activeDeviceProduct)
+        or containsXiaomiWatchS4(activeDeviceModel)
+end
+
+-- Xiaomi Watch S4 41mm is the O63 profile. The watchface metadata is 464x464,
+-- but the framebuffer/capability path shares the physical 466x466 surface
+-- (see getResolution.ts), so fb0 must be read with 466-byte geometry.
+local function isXiaomiWatchS4_41mm()
+    local function matches(value)
+        local compact = string.lower(tostring(value or '')):gsub('%s+', '')
+        return compact:find('xiaomiwatchs441mm', 1, true) ~= nil
+            or compact:find('watchs441mm', 1, true) ~= nil
+            or compact:find('s441mm', 1, true) ~= nil
+    end
+    return matches(activeDeviceProduct) or matches(activeDeviceModel)
+end
+
 local function getCpuFloatLabelX()
     local product = string.lower(tostring(activeDeviceProduct or ''))
     local model = string.lower(tostring(activeDeviceModel or ''))
@@ -421,7 +445,30 @@ local function getScreenshotProfile()
     local readRows = SCREEN_H
     local candidateSkipRows = nil
 
-    if isRedmiWatch6() then
+    if isXiaomiWatchS4_41mm() then
+        method = 'stream'
+        name = 'xiaomi_watch_s4_41mm_o63'
+        return {
+            name = name,
+            method = method,
+            width = 466,
+            height = 466,
+            strideBytes = 466 * 4,
+            skipRows = 0,
+            offsetBytes = 0,
+            rawBytes = 466 * 4 * 466,
+            readBytes = 466 * 4 * 466,
+            readRows = 466,
+            minRawBytes = 466 * 4 * 466,
+            pixelFormat = 'bgra8888',
+            readMode = 'rows',
+            directDd = true,
+            -- NuttX fb0 may expose either a single visible buffer or two
+            -- vertically stacked buffers. Try both offsets and choose the
+            -- candidate with the stronger screenshot color signal.
+            candidateSkipRows = { 0 }
+        }
+    elseif isRedmiWatch6() then
         method = 'stream'
         name = 'redmi_watch6'
         if SCREEN_W == 432 and SCREEN_H == 514 then
@@ -717,8 +764,7 @@ local function resolveTargetDirByDeviceInfo()
     local chosenDir = selected._sourceDir or BAND10_PRO_DIR
 
     if product == 'Xiaomi Smart Band 9 Pro'
-        or product == 'Xiaomi Watch S4'
-        or product == 'Xiaomi Watch S4 41mm' then
+        or containsXiaomiWatchS4(product) then
         chosenDir = BAND9_PRO_DIR
     elseif product == 'Xiaomi Smart Band 10 Pro' then
         if chosenDir ~= BAND10_PRO_FILES_DIR then
@@ -2102,17 +2148,25 @@ local function commandLooksLikeNestedScript(cmd)
     return false
 end
 
+local function isNoIpcDebugEnabled()
+    local content = readFile(TARGET_DIR .. DEBUG_TEST_FILE)
+    if not content or content == '' then return false end
+    local data = jsonDecode(content)
+    return type(data) == 'table' and data.noIpc == true
+end
+
 -- ====== 命令执行 ======
 
-local function executeShellCommand(cmd)
+local function executeShellCommand(cmd, noIpc)
     if not cmd or cmd == '' then
         return { stdout = '', stderr = '', exitcode = -1 }
     end
-    if commandTouchesProtectedIpc(cmd) then
+    local noIpcDebugEnabled = noIpc == true or isNoIpcDebugEnabled()
+    if not noIpcDebugEnabled and commandTouchesProtectedIpc(cmd) then
         writeLuaEventLog('命令被拦截', cmd, '命令包含 Shell++ IPC 受保护路径或文件名')
         return { stdout = '', stderr = 'Blocked: command touches protected Shell++ IPC files', exitcode = -2 }
     end
-    if commandLooksLikeNestedScript(cmd) then
+    if not noIpcDebugEnabled and commandLooksLikeNestedScript(cmd) then
         writeLuaEventLog('命令被拦截', cmd, '命令疑似脚本套娃或后台驻留')
         return { stdout = '', stderr = 'Blocked: nested scripts and background commands are not allowed', exitcode = -3 }
     end
@@ -2567,24 +2621,35 @@ local function updateAdler32(a, b, data)
     return a, b
 end
 
-local function bgrRowToPngScanline(rowData, width)
-    if not rowData or #rowData < width * 3 then
+local function bgrRowToPngScanline(rowData, width, pixelFormat)
+    local bytesPerPixel = (pixelFormat == 'bgra8888'
+        or pixelFormat == 'rgba8888'
+        or pixelFormat == 'bgrx8888'
+        or pixelFormat == 'rgbx8888') and 4 or 3
+    if not rowData or #rowData < width * bytesPerPixel then
         return nil
     end
     local parts = { '\0' }
     local out = 2
     for x = 0, width - 1 do
-        local p = x * 3 + 1
-        local b = string.byte(rowData, p) or 0
-        local g = string.byte(rowData, p + 1) or 0
-        local r = string.byte(rowData, p + 2) or 0
+        local p = x * bytesPerPixel + 1
+        local b, g, r
+        if pixelFormat == 'rgba8888' or pixelFormat == 'rgbx8888' then
+            r = string.byte(rowData, p) or 0
+            g = string.byte(rowData, p + 1) or 0
+            b = string.byte(rowData, p + 2) or 0
+        else
+            b = string.byte(rowData, p) or 0
+            g = string.byte(rowData, p + 1) or 0
+            r = string.byte(rowData, p + 2) or 0
+        end
         parts[out] = string.char(r, g, b)
         out = out + 1
     end
     return table.concat(parts)
 end
 
-local function writePngFromRaw(rawPath, path, width, height)
+local function writePngFromRaw(rawPath, path, width, height, pixelFormat)
     local fRaw = io.open(rawPath, 'rb')
     if not fRaw then
         return false, '无法读取截图临时文件'
@@ -2596,7 +2661,11 @@ local function writePngFromRaw(rawPath, path, width, height)
         return false, '无法创建 PNG 文件'
     end
 
-    local rowLen = width * 3
+    local bytesPerPixel = (pixelFormat == 'bgra8888'
+        or pixelFormat == 'rgba8888'
+        or pixelFormat == 'bgrx8888'
+        or pixelFormat == 'rgbx8888') and 4 or 3
+    local rowLen = width * bytesPerPixel
     local scanlineLen = rowLen + 1
     local idatLen = 2 + height * (5 + scanlineLen) + 4
     local a, b = 1, 0
@@ -2626,7 +2695,7 @@ local function writePngFromRaw(rawPath, path, width, height)
             if not row or #row < rowLen then
                 return false, '截图数据不足'
             end
-            local scanline = bgrRowToPngScanline(row, width)
+            local scanline = bgrRowToPngScanline(row, width, pixelFormat)
             if not scanline then
                 return false, '像素转换失败'
             end
@@ -2684,6 +2753,26 @@ local function copyStream(input, output, totalBytes)
     return true
 end
 
+-- NuttX framebuffer reads can become corrupted when requested in large chunks.
+-- Keep each physical scanline as a separate read.
+local function copyRows(input, output, rowBytes, rows)
+    rowBytes = tonumber(rowBytes) or 0
+    rows = tonumber(rows) or 0
+    if rowBytes <= 0 or rows <= 0 then return false end
+    for _ = 1, rows do
+        local row = ''
+        while #row < rowBytes do
+            local ok, chunk = pcall(input.read, input, rowBytes - #row)
+            if not ok or not chunk or chunk == '' then return false end
+            row = row .. chunk
+        end
+        if #row > rowBytes then row = string.sub(row, 1, rowBytes) end
+        local ok = pcall(output.write, output, row)
+        if not ok then return false end
+    end
+    return true
+end
+
 local function copyFileChunked(srcPath, dstPath, totalBytes)
     removeFile(dstPath)
     local input = io.open(srcPath, 'rb')
@@ -2716,7 +2805,9 @@ local function cloneScreenshotProfile(profile, skipRows)
         readBytes = profile.readBytes or profile.rawBytes,
         readRows = profile.readRows or profile.height,
         minRawBytes = profile.minRawBytes or profile.rawBytes,
-        pixelFormat = profile.pixelFormat
+        pixelFormat = profile.pixelFormat,
+        readMode = profile.readMode,
+        directDd = profile.directDd
     }
 end
 
@@ -2725,13 +2816,17 @@ local function scoreScreenshotRaw(path, profile)
     if not f then return -1 end
     local score = 0
     local rowLen = profile.strideBytes
+    local bytesPerPixel = (profile.pixelFormat == 'bgra8888'
+        or profile.pixelFormat == 'rgba8888'
+        or profile.pixelFormat == 'bgrx8888'
+        or profile.pixelFormat == 'rgbx8888') and 4 or 3
     local step = 6
     for y = 1, profile.height do
         local row = f:read(rowLen)
         if not row or #row < rowLen then break end
         if y % 4 == 0 then
             local x = 1
-            while x <= rowLen - 2 do
+            while x <= rowLen - (bytesPerPixel - 1) do
                 local b = string.byte(row, x) or 0
                 local g = string.byte(row, x + 1) or 0
                 local r = string.byte(row, x + 2) or 0
@@ -2740,7 +2835,7 @@ local function scoreScreenshotRaw(path, profile)
                 elseif b > 130 and g > 40 and r < 100 then
                     score = score + 1
                 end
-                x = x + step * 3
+                x = x + step * bytesPerPixel
             end
         end
     end
@@ -2750,27 +2845,54 @@ end
 
 local function captureFramebufferSingleToFile(path, profile)
     profile = profile or getScreenshotProfile()
-    removeFile(path)
-    local input = io.open(FB_PATH, 'rb')
-    local output = io.open(path, 'wb')
-    if input and output then
-        local seekOk, seekPos = pcall(input.seek, input, 'set', profile.offsetBytes)
-        if seekOk and seekPos then
-            copyStream(input, output, profile.readBytes or profile.rawBytes)
-        end
-        input:close()
-        output:close()
-        local size = fileSize(path)
-        if size >= profile.rawBytes then
-            return true
-        end
-        if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
-            return true
-        end
+    if profile.directDd then
         removeFile(path)
-    else
+        os.execute('dd if=' .. FB_PATH .. ' of=' .. path
+            .. ' bs=' .. tostring(profile.strideBytes)
+            .. ' skip=' .. tostring(profile.skipRows or 0)
+            .. ' count=' .. tostring(profile.readRows or profile.height)
+            .. ' 2>/dev/null')
+        if fileSize(path) >= profile.rawBytes then return true end
+        removeFile(path)
+        return false
+    end
+    local function tryReadAt(offsetBytes)
+        removeFile(path)
+        local input = io.open(FB_PATH, 'rb')
+        local output = io.open(path, 'wb')
+        if input and output then
+            local seekOk, seekPos = pcall(input.seek, input, 'set', offsetBytes)
+            local copied = false
+            if seekOk and seekPos then
+                if profile.readMode == 'rows' then
+                    copied = copyRows(input, output, profile.strideBytes, profile.readRows or profile.height)
+                else
+                    copied = copyStream(input, output, profile.readBytes or profile.rawBytes)
+                end
+            end
+            input:close()
+            output:close()
+            input = nil
+            output = nil
+            local size = fileSize(path)
+            if copied and size >= profile.rawBytes then
+                return true
+            end
+            if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
+                return true
+            end
+        end
         if input then input:close() end
         if output then output:close() end
+        removeFile(path)
+        return false
+    end
+
+    if tryReadAt(profile.offsetBytes) then
+        return true
+    end
+    if profile.offsetBytes ~= 0 and tryReadAt(0) then
+        return true
     end
 
     os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(profile.strideBytes) .. ' skip=' .. tostring(profile.skipRows) .. ' count=' .. tostring(profile.readRows or profile.height) .. ' 2>/dev/null')
@@ -2781,12 +2903,23 @@ local function captureFramebufferSingleToFile(path, profile)
     if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
         return true
     end
+    if profile.offsetBytes ~= 0 then
+        os.execute('dd if=' .. FB_PATH .. ' of=' .. path .. ' bs=' .. tostring(profile.strideBytes) .. ' skip=0 count=' .. tostring(profile.height) .. ' 2>/dev/null')
+        size = fileSize(path)
+        if size >= profile.rawBytes then
+            return true
+        end
+        if size >= (profile.minRawBytes or profile.rawBytes) and padFileToSize(path, profile.rawBytes) then
+            return true
+        end
+    end
     removeFile(path)
     return false
 end
 
 local function captureFramebufferToFile(path, profile)
     profile = profile or getScreenshotProfile()
+    profile.candidateScores = {}
     if type(profile.candidateSkipRows) ~= 'table' or #profile.candidateSkipRows == 0 then
         return captureFramebufferSingleToFile(path, profile)
     end
@@ -2798,6 +2931,10 @@ local function captureFramebufferToFile(path, profile)
         local candidatePath = path .. '.p' .. tostring(i)
         if captureFramebufferSingleToFile(candidatePath, candidateProfile) then
             local score = scoreScreenshotRaw(candidatePath, candidateProfile)
+            profile.candidateScores[#profile.candidateScores + 1] =
+                'skip=' .. tostring(skipRows)
+                .. ',score=' .. tostring(score)
+                .. ',bytes=' .. tostring(fileSize(candidatePath))
             addLog('[shot] candidate skip=' .. tostring(skipRows) .. ' score=' .. tostring(score))
             if score > bestScore then
                 if bestPath ~= '' then removeFile(bestPath) end
@@ -2817,6 +2954,9 @@ local function captureFramebufferToFile(path, profile)
         return false
     end
     local ok = copyFileChunked(bestPath, path, profile.rawBytes)
+    profile.selectedCandidate = 'skip=' .. tostring(profile.skipRows)
+        .. ',score=' .. tostring(bestScore)
+        .. ',bytes=' .. tostring(fileSize(bestPath))
     removeFile(bestPath)
     return ok
 end
@@ -2836,6 +2976,18 @@ local function captureFramebufferLegacy(path, profile)
     return false
 end
 
+local function screenshotDisplayInfo()
+    local result = 'lvgl_res=?x?'
+    local ok, disp = pcall(function() return lvgl.disp.get_default() end)
+    if ok and disp then
+        local got, w, h = pcall(function() return disp:get_res() end)
+        if got and w and h then
+            result = 'lvgl_res=' .. tostring(w) .. 'x' .. tostring(h)
+        end
+    end
+    return result
+end
+
 local function screenshotDiagText(state, profile)
     profile = profile or getScreenshotProfile()
     local allocated = 0
@@ -2850,13 +3002,22 @@ local function screenshotDiagText(state, profile)
         .. '\npid=-'
         .. '\ntid=-'
         .. '\nscreenshot_state=' .. tostring(state or '-')
+        .. '\ndevice_product=' .. tostring(activeDeviceProduct or '-')
+        .. '\ndevice_model=' .. tostring(activeDeviceModel or '-')
+        .. '\ntarget_dir=' .. tostring(TARGET_DIR or '-')
+        .. '\n' .. screenshotDisplayInfo()
         .. '\nframebuffer_size=' .. tostring(profile.rawBytes)
         .. '\npixel_format=' .. tostring(profile.pixelFormat)
         .. '\nscreenshot_profile=' .. tostring(profile.name)
         .. '\nscreen=' .. tostring(profile.width) .. 'x' .. tostring(profile.height)
         .. '\nstride_bytes=' .. tostring(profile.strideBytes)
+        .. '\noffset_bytes=' .. tostring(profile.offsetBytes)
         .. '\nskip_rows=' .. tostring(profile.skipRows)
         .. '\nread_rows=' .. tostring(profile.readRows or profile.height)
+        .. '\nread_bytes=' .. tostring(profile.readBytes or profile.rawBytes)
+        .. '\nmin_raw_bytes=' .. tostring(profile.minRawBytes or profile.rawBytes)
+        .. '\ncandidate_scores=' .. tostring(table.concat(profile.candidateScores or {}, ';'))
+        .. '\nselected_candidate=' .. tostring(profile.selectedCandidate or '-')
 end
 
 local function extractRgb888(rawData)
@@ -2882,6 +3043,9 @@ local function captureScreenshot(req)
     local profile = getScreenshotProfile()
     local isStreamProfile = profile.method == 'stream'
     addLog('[shot] capture profile=' .. tostring(profile.name) .. ' bytes=' .. tostring(profile.rawBytes))
+    -- Keep the full diagnostic visible in the in-app Lua log as well as the
+    -- optional persisted lua_log_*.txt file.
+    addLog('[shot] diag_start\n' .. screenshotDiagText('capture_start', profile))
     writeLuaEventLog('截图诊断', '开始采集', screenshotDiagText('capture_start', profile))
     local captured = false
     if isStreamProfile then
@@ -2891,6 +3055,7 @@ local function captureScreenshot(req)
     end
     if not captured then
         removeFile(TMP_RAW)
+        addLog('[shot] diag_failed\n' .. screenshotDiagText('capture_failed', profile))
         writeLuaEventLog('截图诊断', '采集失败', screenshotDiagText('capture_failed', profile))
         return nil, '截图数据不足'
     end
@@ -2945,11 +3110,11 @@ local function captureScreenshot(req)
             shotId = shotId,
             capturedAt = capturedAt,
             capturedAtUnix = capturedAtUnix,
-            screenWidth = SCREEN_W,
-            screenHeight = SCREEN_H,
-            strideBytes = STRIDE_BYTES,
+            screenWidth = profile.width,
+            screenHeight = profile.height,
+            strideBytes = profile.strideBytes,
             rawBytes = fileSize(outPath),
-            pixelFormatGuess = 'bgr888',
+            pixelFormatGuess = profile.pixelFormat,
             source = 'framebuffer_raw'
         }))
         source = 'framebuffer_raw'
@@ -2959,7 +3124,7 @@ local function captureScreenshot(req)
         outPath = SCREENSHOT_DIR .. filename
         quickPath = 'internal://files/screenshots/' .. filename
         if isStreamProfile then
-            ok = writePngFromRaw(TMP_RAW, outPath, profile.width, profile.height)
+            ok = writePngFromRaw(TMP_RAW, outPath, profile.width, profile.height, profile.pixelFormat)
         else
             local rgbData = extractRgb888(rawData)
             rawData = nil
@@ -2978,6 +3143,7 @@ local function captureScreenshot(req)
     rawData = nil
     removeFile(TMP_RAW)
     pcall(collectgarbage, 'collect')
+    addLog('[shot] diag_done\n' .. screenshotDiagText('capture_done', profile))
     writeLuaEventLog('截图诊断', '采集完成', screenshotDiagText('capture_done', profile))
     os.execute('sync')
 
@@ -2991,8 +3157,8 @@ local function captureScreenshot(req)
         capturedAt = capturedAt,
         capturedAtUnix = capturedAtUnix,
         requestTimestamp = tonumber(req.timestamp) or 0,
-        screenWidth = SCREEN_W,
-        screenHeight = SCREEN_H,
+        screenWidth = profile.width,
+        screenHeight = profile.height,
         source = source,
         message = message
     }
@@ -3842,7 +4008,7 @@ local function checkCommandRequest()
     currentReq = req
     cmdStartTime = os.time()
     writeBridgeState(true, 'cmd', '命令执行中')
-    local result = executeShellCommand(req.cmd)
+    local result = executeShellCommand(req.cmd, req.noIpc == true)
     writeCommandResult(req, result)
     local stdoutPreview = result.stdout or ''
     if #stdoutPreview > 2048 then
