@@ -460,13 +460,19 @@ local function getScreenshotProfile()
             readBytes = 466 * 4 * 466,
             readRows = 466,
             minRawBytes = 466 * 4 * 466,
-            pixelFormat = 'bgra8888',
+            -- NuttX reports FB_FMT_RGB24 (fmt=12), but the plane is stored
+            -- in 32-bit little-endian words: B, G, R, padding/alpha.
+            pixelFormat = 'rgb24_padded32',
             readMode = 'rows',
-            directDd = true,
+            directDd = false,
+            directDdRows = true,
+            seekChunkBytes = 64,
             -- NuttX fb0 may expose either a single visible buffer or two
             -- vertically stacked buffers. Try both offsets and choose the
             -- candidate with the stronger screenshot color signal.
-            candidateSkipRows = { 0 }
+            -- The firmware reserves a multi-buffer framebuffer area. Probe
+            -- each 466-row bank and keep the candidate with valid pixels.
+            candidateSkipRows = { 0, 466, 932 }
         }
     elseif isRedmiWatch6() then
         method = 'stream'
@@ -2625,7 +2631,8 @@ local function bgrRowToPngScanline(rowData, width, pixelFormat)
     local bytesPerPixel = (pixelFormat == 'bgra8888'
         or pixelFormat == 'rgba8888'
         or pixelFormat == 'bgrx8888'
-        or pixelFormat == 'rgbx8888') and 4 or 3
+        or pixelFormat == 'rgbx8888'
+        or pixelFormat == 'rgb24_padded32') and 4 or 3
     if not rowData or #rowData < width * bytesPerPixel then
         return nil
     end
@@ -2664,7 +2671,8 @@ local function writePngFromRaw(rawPath, path, width, height, pixelFormat)
     local bytesPerPixel = (pixelFormat == 'bgra8888'
         or pixelFormat == 'rgba8888'
         or pixelFormat == 'bgrx8888'
-        or pixelFormat == 'rgbx8888') and 4 or 3
+        or pixelFormat == 'rgbx8888'
+        or pixelFormat == 'rgb24_padded32') and 4 or 3
     local rowLen = width * bytesPerPixel
     local scanlineLen = rowLen + 1
     local idatLen = 2 + height * (5 + scanlineLen) + 4
@@ -2807,7 +2815,9 @@ local function cloneScreenshotProfile(profile, skipRows)
         minRawBytes = profile.minRawBytes or profile.rawBytes,
         pixelFormat = profile.pixelFormat,
         readMode = profile.readMode,
-        directDd = profile.directDd
+        directDd = profile.directDd,
+        directDdRows = profile.directDdRows,
+        seekChunkBytes = profile.seekChunkBytes
     }
 end
 
@@ -2819,7 +2829,8 @@ local function scoreScreenshotRaw(path, profile)
     local bytesPerPixel = (profile.pixelFormat == 'bgra8888'
         or profile.pixelFormat == 'rgba8888'
         or profile.pixelFormat == 'bgrx8888'
-        or profile.pixelFormat == 'rgbx8888') and 4 or 3
+        or profile.pixelFormat == 'rgbx8888'
+        or profile.pixelFormat == 'rgb24_padded32') and 4 or 3
     local step = 6
     for y = 1, profile.height do
         local row = f:read(rowLen)
@@ -2845,6 +2856,75 @@ end
 
 local function captureFramebufferSingleToFile(path, profile)
     profile = profile or getScreenshotProfile()
+    if profile.seekChunkBytes then
+        removeFile(path)
+        local input = io.open(FB_PATH, 'rb')
+        local output = io.open(path, 'wb')
+        if not input or not output then
+            if input then input:close() end
+            if output then output:close() end
+            return false
+        end
+        local chunkBytes = tonumber(profile.seekChunkBytes) or 64
+        local okAll = true
+        for y = 0, (profile.readRows or profile.height) - 1 do
+            local row = ''
+            local rowBase = (profile.skipRows or 0) * profile.strideBytes + y * profile.strideBytes
+            for x = 0, profile.strideBytes - 1, chunkBytes do
+                local want = math.min(chunkBytes, profile.strideBytes - x)
+                local seekOk, seekPos = pcall(input.seek, input, 'set', rowBase + x)
+                local readOk, chunk = false, nil
+                if seekOk and seekPos then
+                    readOk, chunk = pcall(input.read, input, want)
+                end
+                if not readOk or not chunk or #chunk < want then
+                    okAll = false
+                    break
+                end
+                row = row .. chunk
+            end
+            if not okAll then break end
+            local writeOk = pcall(output.write, output, row)
+            if not writeOk then okAll = false; break end
+        end
+        input:close()
+        output:close()
+        if okAll and fileSize(path) >= profile.rawBytes then return true end
+        removeFile(path)
+        return false
+    end
+    if profile.directDdRows then
+        removeFile(path)
+        local output = io.open(path, 'wb')
+        if not output then return false end
+        local tmp = path .. '.row'
+        local okAll = true
+        for y = 0, (profile.readRows or profile.height) - 1 do
+            removeFile(tmp)
+            local skipBytes = (profile.skipRows or 0) * profile.strideBytes + y * profile.strideBytes
+            os.execute('dd if=' .. FB_PATH .. ' of=' .. tmp
+                .. ' bs=1 skip=' .. tostring(skipBytes)
+                .. ' count=' .. tostring(profile.strideBytes)
+                .. ' 2>/dev/null')
+            local input = io.open(tmp, 'rb')
+            local row = input and input:read(profile.strideBytes) or nil
+            if input then input:close() end
+            if not row or #row < profile.strideBytes then
+                okAll = false
+                break
+            end
+            local writeOk = pcall(output.write, output, row)
+            if not writeOk then
+                okAll = false
+                break
+            end
+        end
+        output:close()
+        removeFile(tmp)
+        if okAll and fileSize(path) >= profile.rawBytes then return true end
+        removeFile(path)
+        return false
+    end
     if profile.directDd then
         removeFile(path)
         os.execute('dd if=' .. FB_PATH .. ' of=' .. path
