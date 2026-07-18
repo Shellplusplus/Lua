@@ -403,19 +403,6 @@ local function isXiaomiWatchS4()
         or containsXiaomiWatchS4(activeDeviceModel)
 end
 
--- Xiaomi Watch S4 41mm is the O63 profile. The watchface metadata is 464x464,
--- but the framebuffer/capability path shares the physical 466x466 surface
--- (see getResolution.ts), so fb0 must be read with 466-byte geometry.
-local function isXiaomiWatchS4_41mm()
-    local function matches(value)
-        local compact = string.lower(tostring(value or '')):gsub('%s+', '')
-        return compact:find('xiaomiwatchs441mm', 1, true) ~= nil
-            or compact:find('watchs441mm', 1, true) ~= nil
-            or compact:find('s441mm', 1, true) ~= nil
-    end
-    return matches(activeDeviceProduct) or matches(activeDeviceModel)
-end
-
 local function getCpuFloatLabelX()
     local product = string.lower(tostring(activeDeviceProduct or ''))
     local model = string.lower(tostring(activeDeviceModel or ''))
@@ -445,34 +432,29 @@ local function getScreenshotProfile()
     local readRows = SCREEN_H
     local candidateSkipRows = nil
 
-    if isXiaomiWatchS4_41mm() then
-        method = 'stream'
-        name = 'xiaomi_watch_s4_41mm_o63'
+    if isXiaomiWatchS4() then
         return {
-            name = name,
-            method = method,
+            name = 'xiaomi_watch_s4_o63_fb0',
+            method = 'stream',
             width = 466,
             height = 466,
-            strideBytes = 466 * 4,
+            strideBytes = 480 * 4,
             skipRows = 0,
             offsetBytes = 0,
-            rawBytes = 466 * 4 * 466,
-            readBytes = 466 * 4 * 466,
+            rawBytes = 480 * 4 * 466,
+            readBytes = 480 * 4 * 466,
             readRows = 466,
-            minRawBytes = 466 * 4 * 466,
-            -- NuttX reports FB_FMT_RGB24 (fmt=12), but the plane is stored
-            -- in 32-bit little-endian words: B, G, R, padding/alpha.
-            pixelFormat = 'rgb24_padded32',
+            minRawBytes = 480 * 4 * 466,
+            pixelFormat = 'xrgb8888_le',
+            pngConverter = 'o63',
+            sourceBpp = 32,
+            sourceVirtualWidth = 480,
+            sourceVirtualHeight = 932,
+            sourceFramebufferBytes = 480 * 4 * 932,
             readMode = 'rows',
-            directDd = false,
-            directDdRows = true,
-            seekChunkBytes = 64,
-            -- NuttX fb0 may expose either a single visible buffer or two
-            -- vertically stacked buffers. Try both offsets and choose the
-            -- candidate with the stronger screenshot color signal.
-            -- The firmware reserves a multi-buffer framebuffer area. Probe
-            -- each 466-row bank and keep the candidate with valid pixels.
-            candidateSkipRows = { 0, 466, 932 }
+            reopenRows = 4,
+            candidateSkipRows = { 0, 466 },
+            atomicPng = true
         }
     elseif isRedmiWatch6() then
         method = 'stream'
@@ -2627,12 +2609,20 @@ local function updateAdler32(a, b, data)
     return a, b
 end
 
-local function bgrRowToPngScanline(rowData, width, pixelFormat)
-    local bytesPerPixel = (pixelFormat == 'bgra8888'
+local function screenshotBytesPerPixel(pixelFormat)
+    if pixelFormat == 'bgra8888'
         or pixelFormat == 'rgba8888'
         or pixelFormat == 'bgrx8888'
         or pixelFormat == 'rgbx8888'
-        or pixelFormat == 'rgb24_padded32') and 4 or 3
+        or pixelFormat == 'rgb24_padded32'
+        or pixelFormat == 'xrgb8888_le' then
+        return 4
+    end
+    return 3
+end
+
+local function bgrRowToPngScanline(rowData, width, pixelFormat)
+    local bytesPerPixel = screenshotBytesPerPixel(pixelFormat)
     if not rowData or #rowData < width * bytesPerPixel then
         return nil
     end
@@ -2656,7 +2646,7 @@ local function bgrRowToPngScanline(rowData, width, pixelFormat)
     return table.concat(parts)
 end
 
-local function writePngFromRaw(rawPath, path, width, height, pixelFormat)
+local function writePngRows(rawPath, path, width, height, pixelFormat, sourceStrideBytes, rowDecoder)
     local fRaw = io.open(rawPath, 'rb')
     if not fRaw then
         return false, '无法读取截图临时文件'
@@ -2668,13 +2658,15 @@ local function writePngFromRaw(rawPath, path, width, height, pixelFormat)
         return false, '无法创建 PNG 文件'
     end
 
-    local bytesPerPixel = (pixelFormat == 'bgra8888'
-        or pixelFormat == 'rgba8888'
-        or pixelFormat == 'bgrx8888'
-        or pixelFormat == 'rgbx8888'
-        or pixelFormat == 'rgb24_padded32') and 4 or 3
-    local rowLen = width * bytesPerPixel
-    local scanlineLen = rowLen + 1
+    local bytesPerPixel = screenshotBytesPerPixel(pixelFormat)
+    local rowLen = tonumber(sourceStrideBytes) or width * bytesPerPixel
+    if rowLen < width * bytesPerPixel then
+        fRaw:close()
+        writer.close()
+        removeFile(path)
+        return false, '截图行跨度不足'
+    end
+    local scanlineLen = width * 3 + 1
     local idatLen = 2 + height * (5 + scanlineLen) + 4
     local a, b = 1, 0
     local ok = true
@@ -2703,7 +2695,7 @@ local function writePngFromRaw(rawPath, path, width, height, pixelFormat)
             if not row or #row < rowLen then
                 return false, '截图数据不足'
             end
-            local scanline = bgrRowToPngScanline(row, width, pixelFormat)
+            local scanline = rowDecoder(row, width, pixelFormat)
             if not scanline then
                 return false, '像素转换失败'
             end
@@ -2739,6 +2731,58 @@ local function writePngFromRaw(rawPath, path, width, height, pixelFormat)
         return false, err or 'PNG 结束块写入失败'
     end
     return true
+end
+
+writeO63PngFromRaw = function(rawPath, path, profile)
+    local width = tonumber(profile.width) or 466
+    local height = tonumber(profile.height) or 466
+    local rawSize = fileSize(rawPath)
+    local rgb565Size = width * height * 2
+    if rawSize == rgb565Size then
+        local function decodeRgb565(rowData, rowWidth)
+            if not rowData or #rowData < rowWidth * 2 then return nil end
+            local parts = { '\0' }
+            local out = 2
+            for x = 0, rowWidth - 1 do
+                local p = x * 2 + 1
+                local pixel = (string.byte(rowData, p) or 0)
+                    | ((string.byte(rowData, p + 1) or 0) << 8)
+                local r5 = (pixel >> 11) & 0x1F
+                local g6 = (pixel >> 5) & 0x3F
+                local b5 = pixel & 0x1F
+                parts[out] = string.char(
+                    (r5 << 3) | (r5 >> 2),
+                    (g6 << 2) | (g6 >> 4),
+                    (b5 << 3) | (b5 >> 2)
+                )
+                out = out + 1
+            end
+            return table.concat(parts)
+        end
+        return writePngRows(rawPath, path, width, height, 'rgb565le', width * 2,
+            decodeRgb565)
+    end
+    local stride = tonumber(profile.strideBytes) or 1920
+    if stride < width * 4 or rawSize < stride * height then
+        return false, 'O63 截图数据长度或行跨度无效'
+    end
+    local function decodeXrgb8888(rowData, rowWidth)
+        if not rowData or #rowData < rowWidth * 4 then return nil end
+        local parts = { '\0' }
+        local out = 2
+        for x = 0, rowWidth - 1 do
+            local p = x * 4 + 1
+            parts[out] = string.char(
+                string.byte(rowData, p + 2) or 0,
+                string.byte(rowData, p + 1) or 0,
+                string.byte(rowData, p) or 0
+            )
+            out = out + 1
+        end
+        return table.concat(parts)
+    end
+    return writePngRows(rawPath, path, width, height, 'xrgb8888_le', stride,
+        decodeXrgb8888)
 end
 
 local function copyStream(input, output, totalBytes)
@@ -2814,10 +2858,16 @@ local function cloneScreenshotProfile(profile, skipRows)
         readRows = profile.readRows or profile.height,
         minRawBytes = profile.minRawBytes or profile.rawBytes,
         pixelFormat = profile.pixelFormat,
+        sourceBpp = profile.sourceBpp,
+        sourceVirtualWidth = profile.sourceVirtualWidth,
+        sourceVirtualHeight = profile.sourceVirtualHeight,
+        sourceFramebufferBytes = profile.sourceFramebufferBytes,
         readMode = profile.readMode,
+        reopenRows = profile.reopenRows,
         directDd = profile.directDd,
         directDdRows = profile.directDdRows,
-        seekChunkBytes = profile.seekChunkBytes
+        seekChunkBytes = profile.seekChunkBytes,
+        atomicPng = profile.atomicPng
     }
 end
 
@@ -2826,18 +2876,15 @@ local function scoreScreenshotRaw(path, profile)
     if not f then return -1 end
     local score = 0
     local rowLen = profile.strideBytes
-    local bytesPerPixel = (profile.pixelFormat == 'bgra8888'
-        or profile.pixelFormat == 'rgba8888'
-        or profile.pixelFormat == 'bgrx8888'
-        or profile.pixelFormat == 'rgbx8888'
-        or profile.pixelFormat == 'rgb24_padded32') and 4 or 3
+    local visibleRowLen = profile.width * screenshotBytesPerPixel(profile.pixelFormat)
+    local bytesPerPixel = screenshotBytesPerPixel(profile.pixelFormat)
     local step = 6
     for y = 1, profile.height do
         local row = f:read(rowLen)
         if not row or #row < rowLen then break end
         if y % 4 == 0 then
             local x = 1
-            while x <= rowLen - (bytesPerPixel - 1) do
+            while x <= visibleRowLen - (bytesPerPixel - 1) do
                 local b = string.byte(row, x) or 0
                 local g = string.byte(row, x + 1) or 0
                 local r = string.byte(row, x + 2) or 0
@@ -2856,6 +2903,44 @@ end
 
 local function captureFramebufferSingleToFile(path, profile)
     profile = profile or getScreenshotProfile()
+    if profile.reopenRows then
+        removeFile(path)
+        local output = io.open(path, 'wb')
+        if not output then return false end
+        local rowsPerOpen = tonumber(profile.reopenRows) or 1
+        local totalRows = tonumber(profile.readRows) or profile.height
+        local row = 0
+        local okAll = true
+        while row < totalRows do
+            local rows = math.min(rowsPerOpen, totalRows - row)
+            local bytes = rows * profile.strideBytes
+            local offset = ((profile.skipRows or 0) + row) * profile.strideBytes
+            local input = io.open(FB_PATH, 'rb')
+            local chunk = nil
+            if input then
+                local seekOk, seekPos = pcall(input.seek, input, 'set', offset)
+                if seekOk and seekPos then
+                    local readOk, data = pcall(input.read, input, bytes)
+                    if readOk then chunk = data end
+                end
+                input:close()
+            end
+            if not chunk or #chunk ~= bytes then
+                okAll = false
+                break
+            end
+            local writeOk = pcall(output.write, output, chunk)
+            if not writeOk then
+                okAll = false
+                break
+            end
+            row = row + rows
+        end
+        output:close()
+        if okAll and fileSize(path) == profile.rawBytes then return true end
+        removeFile(path)
+        return false
+    end
     if profile.seekChunkBytes then
         removeFile(path)
         local input = io.open(FB_PATH, 'rb')
@@ -3091,6 +3176,10 @@ local function screenshotDiagText(state, profile)
         .. '\nscreenshot_profile=' .. tostring(profile.name)
         .. '\nscreen=' .. tostring(profile.width) .. 'x' .. tostring(profile.height)
         .. '\nstride_bytes=' .. tostring(profile.strideBytes)
+        .. '\nsource_bpp=' .. tostring(profile.sourceBpp or '-')
+        .. '\nsource_virtual=' .. tostring(profile.sourceVirtualWidth or '-')
+        .. 'x' .. tostring(profile.sourceVirtualHeight or '-')
+        .. '\nsource_fblen=' .. tostring(profile.sourceFramebufferBytes or '-')
         .. '\noffset_bytes=' .. tostring(profile.offsetBytes)
         .. '\nskip_rows=' .. tostring(profile.skipRows)
         .. '\nread_rows=' .. tostring(profile.readRows or profile.height)
@@ -3193,6 +3282,8 @@ local function captureScreenshot(req)
             screenWidth = profile.width,
             screenHeight = profile.height,
             strideBytes = profile.strideBytes,
+            sourceStrideBytes = profile.strideBytes,
+            sourceFramebufferBytes = profile.sourceFramebufferBytes,
             rawBytes = fileSize(outPath),
             pixelFormatGuess = profile.pixelFormat,
             source = 'framebuffer_raw'
@@ -3204,7 +3295,29 @@ local function captureScreenshot(req)
         outPath = SCREENSHOT_DIR .. filename
         quickPath = 'internal://files/screenshots/' .. filename
         if isStreamProfile then
-            ok = writePngFromRaw(TMP_RAW, outPath, profile.width, profile.height, profile.pixelFormat)
+            if profile.atomicPng then
+                local temporaryPng = outPath .. '.tmp'
+                removeFile(temporaryPng)
+                if profile.pngConverter == 'o63' then
+                    ok = writeO63PngFromRaw(TMP_RAW, temporaryPng, profile)
+                else
+                    ok = writePngRows(TMP_RAW, temporaryPng, profile.width, profile.height,
+                        profile.pixelFormat, profile.strideBytes, bgrRowToPngScanline)
+                end
+                if ok then
+                    removeFile(outPath)
+                    local renameSafe, renamed = pcall(os.rename, temporaryPng, outPath)
+                    ok = renameSafe and renamed and true or false
+                end
+                if not ok then removeFile(temporaryPng) end
+            else
+                if profile.pngConverter == 'o63' then
+                    ok = writeO63PngFromRaw(TMP_RAW, outPath, profile)
+                else
+                    ok = writePngRows(TMP_RAW, outPath, profile.width, profile.height,
+                        profile.pixelFormat, profile.strideBytes, bgrRowToPngScanline)
+                end
+            end
         else
             local rgbData = extractRgb888(rawData)
             rawData = nil
