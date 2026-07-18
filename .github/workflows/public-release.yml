@@ -1,0 +1,41 @@
+name: Public release artifact
+run-name: Public release ${{ inputs.task_id }} from ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Tag, branch, or commit to package
+        required: true
+        type: string
+      task_id:
+        description: Release Center task ID
+        required: true
+        type: string
+      public_release_title:
+        description: Unified public Release title
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+      - name: Package Lua watch-face payload
+        run: |
+          zip -r shellpp-lua.zip . \
+            -x '.git/*' '.github/*' '.DS_Store' '._*' '*/._*' '.SynologyWorkingDirectory'
+      - name: Upload Release Center artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: shellpp-lua-${{ inputs.task_id }}
+          path: shellpp-lua.zip
+          if-no-files-found: error
+          retention-days: 7
