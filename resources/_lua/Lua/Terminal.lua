@@ -434,23 +434,23 @@ local function getScreenshotProfile()
 
     if isXiaomiWatchS4() then
         return {
-            name = 'xiaomi_watch_s4_o63_fb0',
+            name = 'xiaomi_watch_s4_bgr565',
             method = 'stream',
             width = 466,
             height = 466,
-            strideBytes = 480 * 4,
+            strideBytes = 480 * 2,
             skipRows = 0,
             offsetBytes = 0,
-            rawBytes = 480 * 4 * 466,
-            readBytes = 480 * 4 * 466,
+            rawBytes = 480 * 2 * 466,
+            readBytes = 480 * 2 * 466,
             readRows = 466,
-            minRawBytes = 480 * 4 * 466,
-            pixelFormat = 'xrgb8888_le',
+            minRawBytes = 480 * 2 * 466,
+            pixelFormat = 'bgr565le',
             pngConverter = 'o63',
-            sourceBpp = 32,
+            sourceBpp = 16,
             sourceVirtualWidth = 480,
             sourceVirtualHeight = 932,
-            sourceFramebufferBytes = 480 * 4 * 932,
+            sourceFramebufferBytes = 480 * 2 * 932,
             readMode = 'rows',
             reopenRows = 4,
             candidateSkipRows = { 0, 466 },
@@ -2610,6 +2610,9 @@ local function updateAdler32(a, b, data)
 end
 
 local function screenshotBytesPerPixel(pixelFormat)
+    if pixelFormat == 'rgb565le' or pixelFormat == 'bgr565le' then
+        return 2
+    end
     if pixelFormat == 'bgra8888'
         or pixelFormat == 'rgba8888'
         or pixelFormat == 'bgrx8888'
@@ -2737,9 +2740,14 @@ writeO63PngFromRaw = function(rawPath, path, profile)
     local width = tonumber(profile.width) or 466
     local height = tonumber(profile.height) or 466
     local rawSize = fileSize(rawPath)
+    local pixelFormat = tostring(profile.pixelFormat or '')
     local rgb565Size = width * height * 2
-    if rawSize == rgb565Size then
-        local function decodeRgb565(rowData, rowWidth)
+    if pixelFormat == 'rgb565le' or pixelFormat == 'bgr565le' or rawSize == rgb565Size then
+        local stride = tonumber(profile.strideBytes) or width * 2
+        if stride < width * 2 or rawSize < stride * height then
+            return false, 'O63 BGR565 截图数据长度或行跨度无效'
+        end
+        local function decodeRgb565(rowData, rowWidth, format)
             if not rowData or #rowData < rowWidth * 2 then return nil end
             local parts = { '\0' }
             local out = 2
@@ -2747,9 +2755,12 @@ writeO63PngFromRaw = function(rawPath, path, profile)
                 local p = x * 2 + 1
                 local pixel = (string.byte(rowData, p) or 0)
                     | ((string.byte(rowData, p + 1) or 0) << 8)
-                local r5 = (pixel >> 11) & 0x1F
+                local high5 = (pixel >> 11) & 0x1F
                 local g6 = (pixel >> 5) & 0x3F
-                local b5 = pixel & 0x1F
+                local low5 = pixel & 0x1F
+                local isBgr = format == 'bgr565le'
+                local r5 = isBgr and low5 or high5
+                local b5 = isBgr and high5 or low5
                 parts[out] = string.char(
                     (r5 << 3) | (r5 >> 2),
                     (g6 << 2) | (g6 >> 4),
@@ -2759,7 +2770,7 @@ writeO63PngFromRaw = function(rawPath, path, profile)
             end
             return table.concat(parts)
         end
-        return writePngRows(rawPath, path, width, height, 'rgb565le', width * 2,
+        return writePngRows(rawPath, path, width, height, pixelFormat == 'bgr565le' and 'bgr565le' or 'rgb565le', stride,
             decodeRgb565)
     end
     local stride = tonumber(profile.strideBytes) or 1920
@@ -2885,9 +2896,21 @@ local function scoreScreenshotRaw(path, profile)
         if y % 4 == 0 then
             local x = 1
             while x <= visibleRowLen - (bytesPerPixel - 1) do
-                local b = string.byte(row, x) or 0
-                local g = string.byte(row, x + 1) or 0
-                local r = string.byte(row, x + 2) or 0
+                local b, g, r
+                if profile.pixelFormat == 'bgr565le' then
+                    local pixel = (string.byte(row, x) or 0)
+                        | ((string.byte(row, x + 1) or 0) << 8)
+                    local b5 = (pixel >> 11) & 0x1F
+                    local g6 = (pixel >> 5) & 0x3F
+                    local r5 = pixel & 0x1F
+                    b = (b5 << 3) | (b5 >> 2)
+                    g = (g6 << 2) | (g6 >> 4)
+                    r = (r5 << 3) | (r5 >> 2)
+                else
+                    b = string.byte(row, x) or 0
+                    g = string.byte(row, x + 1) or 0
+                    r = string.byte(row, x + 2) or 0
+                end
                 if b > 180 and g > 70 and g < 180 and r < 80 then
                     score = score + 8
                 elseif b > 130 and g > 40 and r < 100 then
@@ -4445,6 +4468,55 @@ function makeRoundBack(parent, cb)
     return backBtn
 end
 
+function makeWideBack(parent, cb)
+    local backH = UI_TOPBAR_H - UI_GAP
+    local backBtn = lvgl.Object(parent, {
+        x = UI_GAP, y = UI_GAP,
+        w = 72, h = backH,
+        bg_color = UI_CARD,
+        radius = math.floor(backH / 2),
+        border_width = 0,
+        pad_all = 0,
+    })
+    backBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    backBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    local backLbl = lvgl.Label(backBtn, {
+        align = lvgl.ALIGN.CENTER,
+        text = '<',
+        text_font = lvgl.Font("MiSans-Regular", 32),
+        text_color = UI_TEXT,
+    })
+    backLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    backBtn:onevent(lvgl.EVENT.CLICKED, cb)
+    return backBtn
+end
+
+function readStorageUsage()
+    local outputPath = TARGET_DIR .. '.storage_usage.txt'
+    pcall(os.remove, outputPath)
+    pcall(os.execute, 'df -h > "' .. outputPath .. '"')
+    local output = readAll(outputPath, 8192)
+    pcall(os.remove, outputPath)
+    local systemUsage = '未知'
+    local userUsage = '未知'
+    for line in tostring(output or ''):gmatch('[^\r\n]+') do
+        local parts = {}
+        for part in line:gmatch('%S+') do
+            parts[#parts + 1] = part
+        end
+        if #parts >= 4 then
+            local mountPoint = parts[#parts]
+            local usage = tostring(parts[3]) .. '/' .. tostring(parts[2])
+            if mountPoint == '/system' then
+                systemUsage = usage
+            elseif mountPoint == '/data' then
+                userUsage = usage
+            end
+        end
+    end
+    return systemUsage, userUsage
+end
+
 function monitorLogsToText(kind)
     local logs = kind == 'memory' and memoryLogBuffer or cpuLogBuffer
     local text = ''
@@ -4571,26 +4643,7 @@ buildShellPage = function()
     spriteCells = nil
     root:clean()
 
-    -- 顶栏：左返回按钮（圆形：宽高相等、半径取一半）
-    local backDiam = UI_TOPBAR_H - UI_GAP
-    local backBtn = lvgl.Object(root, {
-        x = UI_GAP, y = UI_GAP,
-        w = backDiam, h = backDiam,
-        bg_color = UI_CARD,
-        radius = math.floor(backDiam / 2),
-        border_width = 0,
-        pad_all = 0,
-    })
-    backBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
-    backBtn:add_flag(lvgl.FLAG.CLICKABLE)
-    local backLbl = lvgl.Label(backBtn, {
-        align = lvgl.ALIGN.CENTER,
-        text = '<',
-        text_font = lvgl.Font("MiSans-Regular", 32),
-        text_color = UI_TEXT,
-    })
-    backLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
-    backBtn:onevent(lvgl.EVENT.CLICKED, function() buildHomePage() end)
+    makeWideBack(root, function() buildHomePage() end)
 
     -- 顶栏：右标题，Label 用 align 靠右；垂直下移与圆形返回按钮居中对齐
     lvgl.Label(root, {
@@ -4664,7 +4717,7 @@ buildShellPage = function()
     refreshTerminal()
 end
 
--- log：独立日志页。双击 shell 日志卡片进入，支持滚动查看长日志
+-- log：Lua 扩展菜单
 buildLogPage = function()
     stopPageRefreshTimer()
     currentPage = 'log'
@@ -4679,53 +4732,73 @@ buildLogPage = function()
     clearBtn = nil
     root:clean()
 
-    makeRoundBack(root, function() buildShellPage() end)
+    makeWideBack(root, function() buildShellPage() end)
 
     lvgl.Label(root, {
-        x = 88, y = 14,
-        text = '日志输出',
+        x = 96, y = 14,
+        text = '扩展菜单',
         text_font = lvgl.Font("MiSans-Regular", 30),
         text_color = UI_TEXT,
     })
 
-    local clearW = 116
-    local clearH = UI_BTN_H
-    local clearY = SCREEN_H - UI_GAP - clearH
-    logTerminal = lvgl.Textarea(root, {
-        x = UI_GAP, y = UI_TOPBAR_H + UI_GAP,
+    local _, userUsage = readStorageUsage()
+    local storageY = UI_TOPBAR_H + UI_GAP
+    local storageH = 148
+    local storageCard = lvgl.Object(root, {
+        x = UI_GAP, y = storageY,
         w = SCREEN_W - UI_GAP * 2,
-        h = clearY - UI_GAP - (UI_TOPBAR_H + UI_GAP),
-        text = '',
+        h = storageH,
         bg_color = UI_CARD,
         radius = UI_CARD_RADIUS,
-        text_font = lvgl.Font("MiSans-Regular", 20),
-        text_color = UI_TERM_TEXT,
         border_width = 0,
-        pad_all = 14,
+        pad_all = 0,
     })
-    logTerminal:add_flag(lvgl.FLAG.SCROLLABLE)
-    logTerminal:add_flag(lvgl.FLAG.CLICKABLE)
+    storageCard:clear_flag(lvgl.FLAG.SCROLLABLE)
+    lvgl.Label(storageCard, {
+        x = 18, y = 13,
+        w = 110, h = 34,
+        text = '用户存储',
+        text_font = lvgl.Font("MiSans-Regular", 24),
+        text_color = UI_TEXT,
+    })
+    lvgl.Label(storageCard, {
+        x = 128, y = 13,
+        w = SCREEN_W - UI_GAP * 2 - 146, h = 34,
+        text = userUsage,
+        text_font = lvgl.Font("MiSans-Regular", 24),
+        text_color = UI_TERM_TEXT,
+    })
+    lvgl.Label(storageCard, {
+        x = 18, y = 58,
+        w = SCREEN_W - UI_GAP * 2 - 36, h = 76,
+        text = '手表用户存储空间>45M、手环用户存储空间>35M可能无法正常使用Shell++',
+        text_font = lvgl.Font("MiSans-Regular", 18),
+        text_color = UI_TERM_TEXT,
+    })
 
-    local clearBtnLog = lvgl.Object(root, {
-        x = SCREEN_W - UI_GAP - clearW, y = clearY,
-        w = clearW, h = clearH,
-        bg_color = UI_CARD,
+    local actionY = storageY + storageH + UI_GAP
+    makeCardButton(root, UI_GAP, actionY, SCREEN_W - UI_GAP * 2, 68, 'CPU占用显示', '检测与悬浮显示', UI_CARD, function() buildCpuMonitorPage() end)
+    makeCardButton(root, UI_GAP, actionY + 68 + UI_GAP, SCREEN_W - UI_GAP * 2, 68, '内存占用显示', '检测与悬浮显示', UI_CARD, function() buildMemoryMonitorPage() end)
+
+    local backY = SCREEN_H - UI_GAP - UI_BTN_H
+    local backBtnLog = lvgl.Object(root, {
+        x = UI_GAP, y = backY,
+        w = SCREEN_W - UI_GAP * 2, h = UI_BTN_H,
+        bg_color = UI_PRIMARY,
         radius = UI_BTN_RADIUS,
         border_width = 0,
         pad_all = 0,
     })
-    clearBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
-    clearBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
-    local clearLbl = lvgl.Label(clearBtnLog, {
+    backBtnLog:clear_flag(lvgl.FLAG.SCROLLABLE)
+    backBtnLog:add_flag(lvgl.FLAG.CLICKABLE)
+    local backLblLog = lvgl.Label(backBtnLog, {
         align = lvgl.ALIGN.CENTER,
-        text = 'CLEAR',
+        text = '返回',
         text_font = lvgl.Font("MiSans-Regular", 28),
         text_color = UI_TEXT,
     })
-    clearLbl:add_flag(lvgl.FLAG.EVENT_BUBBLE)
-    clearBtnLog:onevent(lvgl.EVENT.CLICKED, function() clearLog() end)
-
-    refreshTerminal()
+    backLblLog:add_flag(lvgl.FLAG.EVENT_BUBBLE)
+    backBtnLog:onevent(lvgl.EVENT.CLICKED, function() buildShellPage() end)
 end
 
 function buildMonitorControlPage(kind, title, color)

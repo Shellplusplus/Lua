@@ -3,9 +3,9 @@
 	<shape>square</shape>
 	<name>终端同步器</name>
 	<deviceType>N67</deviceType>
-	<version>1.0.0</version>
+	<version>1.0.1</version>
 	<size>336x480</size>
-	<author>小米</author>
+	<author>liangyi</author>
 	<pkgName>000000000000</pkgName>
 	<watchOS>vela</watchOS>
 	<merchantId></merchantId>

@@ -54,5 +54,6 @@
   "aodDisplayMode": "single",
   "formats": {},
   "dataSource": {},
-  "isSlotFollowing": false
+  "isSlotFollowing": false,
+  "introData": {}
 }
