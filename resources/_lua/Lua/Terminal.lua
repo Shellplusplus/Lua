@@ -1,7 +1,4 @@
 -- Terminal.lua
--- Shell 终端桥接表盘
--- 接收快应用的命令/截图/文件请求 → 执行后写回结果
-
 
 --
 --                        _oo0oo_
@@ -33,7 +30,7 @@
 --
 -- @Author        : AzumaChiaki, IKUN-CXKPRO, ziyimiao, ziyimiao5054
 -- @Date          : 2026-06-14 17:21:15
--- @LastEditTime  : 2026-08-07 16:15:16
+-- @LastEditTime  : 2026-08-07 16:27:28
 -- @Project       : Shell++ Lua Backend
 --
 
