@@ -33,7 +33,7 @@
 --
 -- @Author        : AzumaChiaki, IKUN-CXKPRO, ziyimiao, ziyimiao5054
 -- @Date          : 2026-06-14 17:21:15
--- @LastEditTime  : 2026-07-10 00:18:00
+-- @LastEditTime  : 2026-08-07 16:15:16
 -- @Project       : Shell++ Lua Backend
 --
 
@@ -58,6 +58,10 @@ local LOG_HISTORY_LIMIT = 30
 local TMP_RAW = '/tmp/shell_screenshot.raw'
 local STRIDE_BYTES = SCREEN_W * 3
 local SCREENSHOT_CHUNK_SIZE = 32 * 1024
+FILE_TRANSFER_DEFAULT_CHUNK_SIZE = 16 * 1024
+FILE_TRANSFER_MIN_CHUNK_SIZE = 8 * 1024
+FILE_TRANSFER_MAX_CHUNK_SIZE = 64 * 1024
+fileTransferSession = nil
 
 
 
@@ -1744,6 +1748,54 @@ function appPackage(app)
     return tostring(app and app.package or '')
 end
 
+function managedAppIconCacheDir()
+    return TARGET_DIR .. 'app_icons/'
+end
+
+function clearManagedAppIconCache()
+    local cacheDir = managedAppIconCacheDir()
+    pcall(os.execute, 'rm -rf "' .. cacheDir .. '"')
+    pcall(os.execute, 'mkdir -p "' .. cacheDir .. '"')
+    return dirExists(cacheDir)
+end
+
+function copyManagedAppIcon(packageName, sourcePath)
+    if not sourcePath or not fileExists(sourcePath) then return '' end
+    local safePackage = tostring(packageName or ''):gsub('[^%w%._%-]', '_')
+    if safePackage == '' then return '' end
+    local extension = tostring(sourcePath):match('%.([%w]+)$')
+    if not extension then return '' end
+    extension = string.lower(extension)
+    if extension ~= 'png' and extension ~= 'jpg' and extension ~= 'jpeg' and extension ~= 'bmp' then
+        return ''
+    end
+    local filename = safePackage .. '.' .. extension
+    local cacheDir = managedAppIconCacheDir()
+    local targetPath = cacheDir .. filename
+    if fileExists(targetPath) then
+        return 'internal://files/app_icons/' .. filename
+    end
+    mkdir(cacheDir)
+    local input = io.open(sourcePath, 'rb')
+    if not input then return '' end
+    local output = io.open(targetPath, 'wb')
+    if not output then input:close(); return '' end
+    local ok = true
+    while true do
+        local chunk = input:read(4096)
+        if not chunk or chunk == '' then break end
+        local wrote = output:write(chunk)
+        if not wrote then ok = false; break end
+    end
+    input:close()
+    output:close()
+    if not ok then
+        os.remove(targetPath)
+        return ''
+    end
+    return 'internal://files/app_icons/' .. filename
+end
+
 function appendManagedApp(list, seen, app, hidden, appDir)
     local packageName = appPackage(app)
     if packageName == '' or seen[packageName] then return end
@@ -1755,8 +1807,9 @@ function appendManagedApp(list, seen, app, hidden, appDir)
     item.hideFlag = hidden == true and true or nil
     item.locked = packageIsShellPlusPlus(packageName)
     if appDir and item.icon then
-        local iconPath = appDir .. packageName .. '/' .. item.icon
-        if fileExists(iconPath) then item.iconPath = iconPath end
+        local sourceIconPath = appDir .. packageName .. '/' .. item.icon
+        local quickIconPath = copyManagedAppIcon(packageName, sourceIconPath)
+        if quickIconPath ~= '' then item.iconPath = quickIconPath end
     end
     list[#list + 1] = item
 end
@@ -1927,7 +1980,7 @@ function getSingleAppSize(packageName)
         local ok, dir = pcall(function() return lvgl.fs.open_dir(p) end)
         if ok and dir then
             pcall(dir.close, dir)
-            local sz = getFolderSize(p)
+            local sz = cacheFolderSize(p)
             total = total + (sz or 0)
         end
     end
@@ -2006,6 +2059,14 @@ function executeAppManagerRequest(req)
         }
     end
     if action == 'apps' then return appManagerListResult(action) end
+    if action == 'icon_cache_reset' then
+        local ok = clearManagedAppIconCache()
+        return {
+            status = ok and 'ok' or 'error',
+            action = action,
+            message = ok and '图标缓存已清理' or '图标缓存清理失败'
+        }
+    end
     if action == 'set_visible' then return appManagerSetVisible(req) end
     if action == 'delete' then return appManagerDelete(req) end
     if action == 'app_size' then return appManagerAppSize(req) end
@@ -2079,6 +2140,7 @@ local function commandTouchesProtectedIpc(cmd)
         'cmd_request.json', 'cmd_result.json',
         'screenshot_request.json', 'screenshot_result.json',
         'file_request.json', 'file_result.json',
+        'file_transfer_request.json', 'file_transfer_result.json', 'file_transfer/',
         'app_manager_request.json', 'app_manager_result.json',
         'cpu_monitor_request.json', 'cpu_monitor_result.json', 'cpu_monitor_state.json',
         'memory_monitor_request.json', 'memory_monitor_result.json', 'memory_monitor_state.json',
@@ -3477,6 +3539,7 @@ function readAppManagerRequest()
         operation = json.operation,
         visible = json.visible,
         all = json.all,
+        package = json.package,
         packages = json.packages,
         timestamp = json.timestamp
     }
@@ -3612,6 +3675,33 @@ local function readFileRequest()
     }
 end
 
+function readFileTransferRequest()
+    local reqFile = TARGET_DIR .. 'file_transfer_request.json'
+    if not fileExists(reqFile) then return nil end
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then return nil end
+    end
+    if not json.seq or not json.action or not json.sessionId then return nil end
+    if not validateIpcGuard(json, 'file_transfer_request.json') then return nil end
+    return {
+        seq = json.seq,
+        type = 'file_transfer',
+        action = json.action,
+        sessionId = tostring(json.sessionId),
+        path = json.path or '',
+        index = tonumber(json.index) or 0,
+        chunkSize = tonumber(json.chunkSize) or FILE_TRANSFER_DEFAULT_CHUNK_SIZE,
+        timestamp = json.timestamp
+    }
+end
+
 -- ====== 写入命令结果 ======
 
 local function writeCommandResult(req, result)
@@ -3680,6 +3770,17 @@ local function writeFileResult(req, result)
     result.timestamp = os.date('%H:%M:%S')
     atomicWrite('file_result.json', result)
     os.remove(TARGET_DIR .. 'file_request.json')
+end
+
+function writeFileTransferResult(req, result)
+    result = result or {}
+    result.type = 'file_transfer_result'
+    result.seq = req and req.seq or -1
+    result.action = req and req.action or ''
+    result.sessionId = req and req.sessionId or ''
+    result.timestamp = os.date('%H:%M:%S')
+    atomicWrite('file_transfer_result.json', result)
+    os.remove(TARGET_DIR .. 'file_transfer_request.json')
 end
 
 local function finishScreenshotError(message)
@@ -3878,6 +3979,18 @@ local function fileManagerSize(path)
     return '-'
 end
 
+function fileManagerSizeBytes(path)
+    local ok, size = pcall(function()
+        local f = lvgl.fs.open_file(path, 'r')
+        if not f then return nil end
+        local len = f:seek('end')
+        f:close()
+        return tonumber(len)
+    end)
+    if ok and size and size >= 0 then return math.floor(size) end
+    return 0
+end
+
 local function fileManagerList(path)
     path = normalizeFileManagerPath(path)
     local ok, dir, msg = pcall(lvgl.fs.open_dir, path)
@@ -3954,7 +4067,7 @@ local function fileManagerHex(path, offset, length)
     length = tonumber(length) or 128
     if offset < 0 then offset = 0 end
     if length < 16 then length = 16 end
-    if length > 512 then length = 512 end
+    if length > 2048 then length = 2048 end
     local ok, content = pcall(function()
         local f = lvgl.fs.open_file(path, 'r')
         if not f then return nil end
@@ -3979,6 +4092,93 @@ local function fileManagerHex(path, offset, length)
         return { status = 'error', message = 'hex read failed', path = path, content = '' }
     end
     return { status = 'ok', path = path, content = content, offset = offset }
+end
+
+function isValidFileTransferSessionId(sessionId)
+    return type(sessionId) == 'string' and #sessionId > 0 and #sessionId <= 64
+        and string.match(sessionId, '^[%w_-]+$') ~= nil
+end
+
+function fileTransferStagePath(sessionId)
+    return TARGET_DIR .. 'file_transfer/' .. sessionId .. '.part'
+end
+
+function stageFileTransferChunk(session, index)
+    if index < 0 or index >= session.total then return nil, 0, 'invalid_chunk_index' end
+    local offset = index * session.chunkSize
+    local expected = math.min(session.size - offset, session.chunkSize)
+    if expected <= 0 then return nil, 0, 'empty_chunk' end
+    local ok, actual = pcall(function()
+        local input = lvgl.fs.open_file(session.path, 'r')
+        if not input then return nil end
+        input:seek('set', offset)
+        mkdir(TARGET_DIR .. 'file_transfer/')
+        local output = io.open(fileTransferStagePath(session.sessionId), 'wb')
+        if not output then input:close(); return nil end
+        local remaining = expected
+        local written = 0
+        while remaining > 0 do
+            local chunk = input:read(math.min(4096, remaining))
+            if not chunk or chunk == '' then break end
+            output:write(chunk)
+            written = written + #chunk
+            remaining = remaining - #chunk
+        end
+        input:close()
+        output:close()
+        return written
+    end)
+    if not ok or not actual or actual <= 0 then
+        os.remove(fileTransferStagePath(session.sessionId))
+        return nil, 0, 'stage_failed'
+    end
+    return 'file_transfer/' .. session.sessionId .. '.part', actual, ''
+end
+
+function executeFileTransferRequest(req)
+    if not isValidFileTransferSessionId(req.sessionId) then
+        return { status = 'error', message = 'invalid_session_id' }
+    end
+    if req.action == 'start' then
+        if fileTransferSession then return { status = 'error', message = 'busy' } end
+        local path = normalizeFileManagerPath(req.path)
+        local size = fileManagerSizeBytes(path)
+        if size <= 0 then return { status = 'error', message = 'file_not_found_or_empty', path = path } end
+        local chunkSize = math.floor(req.chunkSize or FILE_TRANSFER_DEFAULT_CHUNK_SIZE)
+        if chunkSize < FILE_TRANSFER_MIN_CHUNK_SIZE then chunkSize = FILE_TRANSFER_MIN_CHUNK_SIZE end
+        if chunkSize > FILE_TRANSFER_MAX_CHUNK_SIZE then chunkSize = FILE_TRANSFER_MAX_CHUNK_SIZE end
+        fileTransferSession = {
+            sessionId = req.sessionId,
+            path = path,
+            name = basename(path),
+            size = size,
+            chunkSize = chunkSize,
+            total = math.ceil(size / chunkSize)
+        }
+        return {
+            status = 'ok', path = path, name = basename(path), sizeBytes = size,
+            chunkSize = chunkSize, total = fileTransferSession.total
+        }
+    end
+    local session = fileTransferSession
+    if not session or session.sessionId ~= req.sessionId then
+        return { status = 'error', message = 'session_not_found' }
+    end
+    if req.action == 'chunk' then
+        local stagedFile, sizeBytes, message = stageFileTransferChunk(session, math.floor(req.index or 0))
+        if not stagedFile then return { status = 'error', message = message, path = session.path } end
+        return {
+            status = 'ok', path = session.path, stagedFile = stagedFile,
+            sizeBytes = sizeBytes, offset = math.floor(req.index or 0) * session.chunkSize,
+            index = math.floor(req.index or 0), total = session.total
+        }
+    end
+    if req.action == 'finish' or req.action == 'abort' then
+        os.remove(fileTransferStagePath(session.sessionId))
+        fileTransferSession = nil
+        return { status = 'ok', path = session.path }
+    end
+    return { status = 'error', message = 'unknown_action' }
 end
 
 local function fileManagerWrite(req)
@@ -4211,6 +4411,25 @@ local function checkFileRequest()
     writeBridgeState(false, '', '')
 end
 
+function checkFileTransferRequest()
+    if cmdBusy then return end
+    if not isRunning then return end
+    local req = readFileTransferRequest()
+    if not req then return end
+    cmdBusy = true
+    busyMode = 'file_transfer'
+    writeBridgeState(true, 'file_transfer', '文件传输准备中')
+    local ok, result = pcall(function() return executeFileTransferRequest(req) end)
+    if ok then
+        writeFileTransferResult(req, result)
+    else
+        writeFileTransferResult(req, { status = 'error', message = tostring(result or 'file_transfer_failed') })
+    end
+    cmdBusy = false
+    busyMode = ''
+    writeBridgeState(false, '', '')
+end
+
 local function checkCommandRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -4348,6 +4567,7 @@ local function startService()
                 checkMemoryMonitorRequest()
                 checkScreenshotFloatRequest()
                 checkAppManagerRequest()
+                checkFileTransferRequest()
                 checkFileRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
