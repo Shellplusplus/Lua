@@ -3693,6 +3693,8 @@ function readFileTransferRequest()
         action = json.action,
         sessionId = tostring(json.sessionId),
         path = json.path or '',
+        offset = tonumber(json.offset) or 0,
+        length = tonumber(json.length) or 0,
         index = tonumber(json.index) or 0,
         chunkSize = tonumber(json.chunkSize) or FILE_TRANSFER_DEFAULT_CHUNK_SIZE,
         timestamp = json.timestamp
@@ -4102,8 +4104,9 @@ end
 
 function stageFileTransferChunk(session, index)
     if index < 0 or index >= session.total then return nil, 0, 'invalid_chunk_index' end
-    local offset = index * session.chunkSize
-    local expected = math.min(session.size - offset, session.chunkSize)
+    local offset = session.offset + index * session.chunkSize
+    local rangeEnd = session.offset + session.length
+    local expected = math.min(rangeEnd - offset, session.chunkSize)
     if expected <= 0 then return nil, 0, 'empty_chunk' end
     local ok, actual = pcall(function()
         local input = lvgl.fs.open_file(session.path, 'r')
@@ -4137,10 +4140,24 @@ function executeFileTransferRequest(req)
         return { status = 'error', message = 'invalid_session_id' }
     end
     if req.action == 'start' then
-        if fileTransferSession then return { status = 'error', message = 'busy' } end
+        -- 覆盖旧会话：RPK 异常退出时旧会话会残留导致永久 busy
+        -- 新 start 请求到来时直接作废旧会话，并清空整个 file_transfer/ 目录
+        -- 原始实现（会导致死锁）：if fileTransferSession then return { status = 'error', message = 'busy' } end
+        if fileTransferSession then
+            fileTransferSession = nil
+        end
+        -- 清空 file_transfer/ 目录下所有残留 .part（历史孤儿文件也一并清理）
+        pcall(os.execute, 'rm -rf "' .. TARGET_DIR .. 'file_transfer/"')
+        mkdir(TARGET_DIR .. 'file_transfer/')
         local path = normalizeFileManagerPath(req.path)
         local size = fileManagerSizeBytes(path)
         if size <= 0 then return { status = 'error', message = 'file_not_found_or_empty', path = path } end
+        local offset = tonumber(req.offset) or 0
+        if offset < 0 then offset = 0 end
+        if offset >= size then return { status = 'error', message = 'offset_out_of_range', path = path, sizeBytes = size } end
+        local length = tonumber(req.length) or 0
+        if length <= 0 then length = size - offset end
+        if offset + length > size then length = size - offset end
         local chunkSize = math.floor(req.chunkSize or FILE_TRANSFER_DEFAULT_CHUNK_SIZE)
         if chunkSize < FILE_TRANSFER_MIN_CHUNK_SIZE then chunkSize = FILE_TRANSFER_MIN_CHUNK_SIZE end
         if chunkSize > FILE_TRANSFER_MAX_CHUNK_SIZE then chunkSize = FILE_TRANSFER_MAX_CHUNK_SIZE end
@@ -4149,12 +4166,14 @@ function executeFileTransferRequest(req)
             path = path,
             name = basename(path),
             size = size,
+            offset = offset,
+            length = length,
             chunkSize = chunkSize,
-            total = math.ceil(size / chunkSize)
+            total = math.max(0, math.ceil(length / chunkSize))
         }
         return {
             status = 'ok', path = path, name = basename(path), sizeBytes = size,
-            chunkSize = chunkSize, total = fileTransferSession.total
+            offset = offset, length = length, chunkSize = chunkSize, total = fileTransferSession.total
         }
     end
     local session = fileTransferSession
@@ -4166,7 +4185,7 @@ function executeFileTransferRequest(req)
         if not stagedFile then return { status = 'error', message = message, path = session.path } end
         return {
             status = 'ok', path = session.path, stagedFile = stagedFile,
-            sizeBytes = sizeBytes, offset = math.floor(req.index or 0) * session.chunkSize,
+            sizeBytes = sizeBytes, offset = session.offset + math.floor(req.index or 0) * session.chunkSize,
             index = math.floor(req.index or 0), total = session.total
         }
     end
