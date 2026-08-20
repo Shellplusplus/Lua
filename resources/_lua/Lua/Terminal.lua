@@ -2036,7 +2036,10 @@ function executeAppManagerRequest(req)
         for i = 1, #CACHE_CLEAN_PATHS do
             deleteCachePath(CACHE_CLEAN_PATHS[i])
         end
-        deleteMassRootLooseFiles()
+        -- RW6 将本地音乐直接存放在 /data/mass/ 根目录，不能按缓存删除。
+        if not isRedmiWatch6() then
+            deleteMassRootLooseFiles()
+        end
         pcall(collectgarbage, 'collect')
         local afterItems, afterTotal = buildCacheItems()
         local freed = beforeTotal - afterTotal
