@@ -2142,6 +2142,7 @@ local function commandTouchesProtectedIpc(cmd)
         'file_request.json', 'file_result.json',
         'file_transfer_request.json', 'file_transfer_result.json', 'file_transfer/',
         'app_manager_request.json', 'app_manager_result.json',
+        'property_request.json', 'property_result.json',
         'cpu_monitor_request.json', 'cpu_monitor_result.json', 'cpu_monitor_state.json',
         'memory_monitor_request.json', 'memory_monitor_result.json', 'memory_monitor_state.json',
         'screenshot_float_request.json', 'screenshot_float_result.json', 'screenshot_float_state.json',
@@ -2246,6 +2247,25 @@ local function executeShellCommand(cmd, noIpc)
 
     addLog('[' .. ts .. '] Done (' .. #stdout .. ' bytes)')
     return { stdout = stdout, stderr = '', exitcode = exitcode }
+end
+
+function executePropertyRequest(req)
+    local outFile = TARGET_DIR .. '.property_stdout.txt'
+    os.remove(outFile)
+    if req.action == 'get' then
+        os.execute('getprop ' .. req.property .. ' > "' .. outFile .. '"')
+        local value = (readAll(outFile, 256) or ''):gsub('%s+$', '')
+        os.remove(outFile)
+        return { status = 'ok', value = value, message = '属性已读取' }
+    end
+    os.execute('setprop ' .. req.property .. ' ' .. req.value)
+    os.execute('getprop ' .. req.property .. ' > "' .. outFile .. '"')
+    local value = (readAll(outFile, 256) or ''):gsub('%s+$', '')
+    os.remove(outFile)
+    if value ~= req.value then
+        return { status = 'error', value = value, message = '属性写入验证失败' }
+    end
+    return { status = 'ok', value = value, message = '属性已保存' }
 end
 
 local function writeScreenshotResult(data)
@@ -3675,6 +3695,42 @@ local function readFileRequest()
     }
 end
 
+-- System-extension property bridge: only numeric persist.screen.* settings are exposed.
+-- The operation itself is limited to getprop/setprop by readPropertyRequest().
+function isSystemExtensionProperty(property)
+    return type(property) == 'string'
+        and string.match(property, '^persist%.screen%.[a-z0-9_%.]+$') ~= nil
+end
+
+function readPropertyRequest()
+    local reqFile = TARGET_DIR .. 'property_request.json'
+    if not fileExists(reqFile) then return nil end
+    local content = readFile(reqFile)
+    if not content or content == '' then return nil end
+    local json = jsonDecode(content)
+    if not json then
+        os.execute('sleep 0.1')
+        content = readFile(reqFile)
+        if not content or content == '' then return nil end
+        json = jsonDecode(content)
+        if not json then return nil end
+    end
+    if not json.seq or (json.action ~= 'get' and json.action ~= 'set') then return nil end
+    if not isSystemExtensionProperty(json.property) then
+        rejectInjectedRequest('property_request.json', '属性不在系统扩展允许范围内')
+        return nil
+    end
+    if json.action == 'set' then
+        local valid = type(json.value) == 'string' and string.match(json.value, '^%d+$')
+        if not valid then
+            rejectInjectedRequest('property_request.json', '属性值不合法')
+            return nil
+        end
+    end
+    if not validateIpcGuard(json, 'property_request.json') then return nil end
+    return { seq = json.seq, type = 'property', action = json.action, property = json.property, value = json.value or '' }
+end
+
 function readFileTransferRequest()
     local reqFile = TARGET_DIR .. 'file_transfer_request.json'
     if not fileExists(reqFile) then return nil end
@@ -3772,6 +3828,17 @@ local function writeFileResult(req, result)
     result.timestamp = os.date('%H:%M:%S')
     atomicWrite('file_result.json', result)
     os.remove(TARGET_DIR .. 'file_request.json')
+end
+
+function writePropertyResult(req, result)
+    result = result or {}
+    result.type = 'property_result'
+    result.seq = req and req.seq or -1
+    result.action = req and req.action or ''
+    result.property = req and req.property or ''
+    result.timestamp = os.date('%H:%M:%S')
+    atomicWrite('property_result.json', result)
+    os.remove(TARGET_DIR .. 'property_request.json')
 end
 
 function writeFileTransferResult(req, result)
@@ -4430,6 +4497,24 @@ local function checkFileRequest()
     writeBridgeState(false, '', '')
 end
 
+function checkPropertyRequest()
+    if cmdBusy then return end
+    if not isRunning then return end
+    local req = readPropertyRequest()
+    if not req then return end
+    cmdBusy = true
+    busyMode = 'property'
+    writeBridgeState(true, 'property', '系统属性操作中')
+    local ok, result = pcall(function() return executePropertyRequest(req) end)
+    if ok then writePropertyResult(req, result)
+    else writePropertyResult(req, { status = 'error', message = tostring(result or '属性操作失败') }) end
+    writeLuaEventLog('系统属性', req.action .. ' ' .. req.property,
+        '序号: ' .. tostring(req.seq or -1) .. '\n操作: ' .. tostring(req.action) .. '\n属性: ' .. tostring(req.property))
+    cmdBusy = false
+    busyMode = ''
+    writeBridgeState(false, '', '')
+end
+
 function checkFileTransferRequest()
     if cmdBusy then return end
     if not isRunning then return end
@@ -4588,6 +4673,7 @@ local function startService()
                 checkAppManagerRequest()
                 checkFileTransferRequest()
                 checkFileRequest()
+                checkPropertyRequest()
                 checkScreenshotRequest()
                 checkCommandRequest()
             end

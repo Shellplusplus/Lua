@@ -3,10 +3,10 @@
 	<shape>square</shape>
 	<name>终端同步器</name>
 	<deviceType>N67</deviceType>
-	<version>1.0.2-2</version>
+	<version>1.0.3</version>
 	<size>336x480</size>
 	<author>liangyi</author>
-	<pkgName>000000000000</pkgName>
+	<pkgName>979889683730</pkgName>
 	<watchOS>vela</watchOS>
 	<merchantId></merchantId>
 	<introduce></introduce>
