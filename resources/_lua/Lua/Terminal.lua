@@ -30,7 +30,7 @@
 --
 -- @Author        : AzumaChiaki, IKUN-CXKPRO, ziyimiao, ziyimiao5054
 -- @Date          : 2026-06-14 17:21:15
--- @LastEditTime  : 2026-08-07 16:27:28
+-- @LastEditTime  : 2026-09-06 01:37:22
 -- @Project       : Shell++ Lua Backend
 --
 
@@ -2127,6 +2127,10 @@ local function validateIpcGuard(req, filename)
     ensureIpcGuard()
     if not req or req.guard ~= ipcGuardToken then
         rejectInjectedRequest(filename, '缺少或错误的安全令牌')
+        if req and req.seq and (filename == 'property_request.json' or filename == 'file_request.json') then
+            local resultFile = filename:gsub('_request.json$', '_result.json')
+            atomicWrite(resultFile, { seq = req.seq, action = req.action, status = 'error', code = 'guard_expired', message = 'guard expired' })
+        end
         return false
     end
     rotateIpcGuard()
@@ -2249,23 +2253,157 @@ local function executeShellCommand(cmd, noIpc)
     return { stdout = stdout, stderr = '', exitcode = exitcode }
 end
 
+function executeAboutSystemRequest(req)
+    local version
+    local diagnostics = {}
+    local function failure(code)
+        return { status = 'error', code = code, message = code, version = version, detail = table.concat(diagnostics, '\n') }
+    end
+    local function run(command)
+        local ok, result = pcall(os.execute, command)
+        return ok and (result == true or result == 0)
+    end
+    local function binary(path)
+        local f = io.open(path, 'rb')
+        if not f then return nil end
+        local data = f:read('*a')
+        f:close()
+        return data
+    end
+    local function save(path, data)
+        local f = io.open(path, 'wb')
+        if not f then return false end
+        local ok, result = pcall(f.write, f, data)
+        local closed, closeResult = pcall(f.close, f)
+        return ok and result ~= nil and closed and closeResult ~= nil and binary(path) == data
+    end
+    local tmp = TARGET_DIR .. '.about_ap_read.bin'
+    local function readdev(offset, size)
+        os.remove(tmp)
+        if not run(string.format('dd if=/dev/ap of="%s" bs=1 skip=%d count=%d', tmp, offset, size)) then return nil end
+        local data = binary(tmp)
+        os.remove(tmp)
+        if not data or #data ~= size then return nil end
+        return data
+    end
+    local function writeDevice(offset, data)
+        local path = TARGET_DIR .. '.about_ap_write.bin'
+        if not save(path, data) then return false end
+        local ok = run(string.format('dd if="%s" of=/dev/ap bs=1 seek=%d count=%d conv=notrunc', path, offset, #data))
+        os.remove(path)
+        return ok
+    end
+    local function validText(value)
+        if type(value) ~= 'string' or #value < 1 or #value > 15 or not value:find('%S') then return false end
+        if not value:find('[^ -~]') then return true end
+        if not utf8 or not utf8.codes then return false end
+        local ok, valid = pcall(function()
+            for _, code in utf8.codes(value) do
+                if code < 32 or (code >= 127 and code <= 159) then return false end
+            end
+            return true
+        end)
+        return ok and valid
+    end
+    local versionPath = TARGET_DIR .. '.about_firmware.txt'
+    os.remove(versionPath)
+    local versionOK = run('getprop ro.build.version > "' .. versionPath .. '"')
+    local raw = binary(versionPath)
+    os.remove(versionPath)
+    if not versionOK or not raw then return failure('about_version_failed') end
+    version = raw:match('^%s*(.-)%s*$')
+    local profiles = {
+        ['3.101.036'] = { offset = 11169676, window = 11169648, length = 96, a1offset = 9, a1 = 'ro.build.version\0', a2offset = 29, a3offset = 45, block = 11165696 },
+        ['3.101.043'] = { offset = 11304860, window = 11304836, length = 68, a1offset = 1, a1 = 'persist.ble_static_addr\0', a2offset = 25, a3offset = 41, block = 11300864 }
+    }
+    local p = profiles[version]
+    if not p then return { status = 'ok', supported = false, version = version } end
+    local context = readdev(p.window, p.length)
+    local anchor = '[%s] %s: miwear_model %s\n\0'
+    diagnostics[#diagnostics + 1] = 'READ ' .. version .. ' @' .. string.format('0x%X', p.window)
+    diagnostics[#diagnostics + 1] = 'bytes: ' .. tostring(context and #context or 0) .. '/' .. tostring(p.length)
+    if context then
+        local hex = {}
+        for i = 1, #context do
+            hex[#hex + 1] = string.format('%02X', context:byte(i)) .. (i % 8 == 0 and '\n' or ' ')
+        end
+        diagnostics[#diagnostics + 1] = table.concat(hex)
+        diagnostics[#diagnostics + 1] = 'a1 match: ' .. tostring(context:sub(p.a1offset, p.a1offset + #p.a1 - 1) == p.a1)
+        diagnostics[#diagnostics + 1] = 'a3 match: ' .. tostring(context:sub(p.a3offset, p.a3offset + #anchor - 1) == anchor)
+        diagnostics[#diagnostics + 1] = 'a2: ' .. context:sub(p.a2offset, p.a2offset + 15):gsub('[^ -~]', function(c) return string.format('[%02X]', c:byte()) end)
+        diagnostics[#diagnostics + 1] = 'utf8.codes: ' .. tostring(utf8 and type(utf8.codes) == 'function' or false)
+    end
+    if not context or context:sub(p.a1offset, p.a1offset + #p.a1 - 1) ~= p.a1 or context:sub(p.a3offset, p.a3offset + #anchor - 1) ~= anchor then
+        return failure('about_anchor_failed')
+    end
+    local current = context:sub(p.a2offset, p.a2offset + 15)
+    local text = current:match('^([^%z]+)%z')
+    if not validText(text) or current ~= text .. string.rep('\0', 16 - #text) then return failure('about_content_failed') end
+    if req.action == 'about_status' then
+        return { status = 'ok', supported = true, version = version, value = text, maxBytes = 15, detail = table.concat(diagnostics, '\n') }
+    end
+    local value = req.action == 'about_restore' and 'Xiaomi HyperOS' or req.value
+    if not validText(value) then return failure('about_invalid_text') end
+    local desired = value .. string.rep('\0', 16 - #value)
+    if current == desired then return { status = 'ok', supported = true, version = version, value = value } end
+    local block = readdev(p.block, 4096)
+    local position = p.offset - p.block + 1
+    if not block or block:sub(position, position + 15) ~= current then return failure('about_backup_failed') end
+    local backupPath = TARGET_DIR .. 'about_ap_' .. version .. '.bin'
+    local backup = binary(backupPath)
+    if backup then
+        if #backup ~= 4096 or backup:sub(1, position - 1) ~= block:sub(1, position - 1) or backup:sub(position + 16) ~= block:sub(position + 16) then return failure('about_backup_failed') end
+    elseif not save(backupPath, block) then return failure('about_backup_failed') end
+    if not save(TARGET_DIR .. 'about_ap_previous_' .. version .. '.bin', block) then return failure('about_backup_failed') end
+    local slack = 15204352
+    local erased = string.rep('\255', 8)
+    if readdev(slack, 8) ~= erased then return failure('about_flash_gate_failed') end
+    local zeroOK = writeDevice(slack, string.rep('\0', 8))
+    local zeroRead = readdev(slack, 8)
+    local eraseOK = writeDevice(slack, erased)
+    if not zeroOK or zeroRead ~= string.rep('\0', 8) or not eraseOK or readdev(slack, 8) ~= erased then return failure('about_flash_gate_failed') end
+    if readdev(p.block, 4096) ~= block then return failure('about_content_failed') end
+    local expected = block:sub(1, position - 1) .. desired .. block:sub(position + 16)
+    local written = writeDevice(p.offset, desired)
+    if not written or readdev(p.block, 4096) ~= expected then
+        writeDevice(p.block, block)
+        if readdev(p.block, 4096) ~= block then return failure('about_recovery_failed') end
+        return failure('about_write_rolled_back')
+    end
+    return { status = 'ok', supported = true, version = version, value = value }
+end
+
 function executePropertyRequest(req)
+    if req.action == 'about_status' or req.action == 'about_set' or req.action == 'about_restore' then
+        return executeAboutSystemRequest(req)
+    end
     local outFile = TARGET_DIR .. '.property_stdout.txt'
-    os.remove(outFile)
-    if req.action == 'get' then
-        os.execute('getprop ' .. req.property .. ' > "' .. outFile .. '"')
-        local value = (readAll(outFile, 256) or ''):gsub('%s+$', '')
+    local function readProperty()
         os.remove(outFile)
-        return { status = 'ok', value = value, message = '属性已读取' }
+        local ok, code, reason, exitCode = pcall(os.execute, 'getprop ' .. req.property .. ' > "' .. outFile .. '"')
+        local output = readFile(outFile)
+        os.remove(outFile)
+        if not ok or code == false or (code == nil and reason ~= nil) or (type(code) == 'number' and code ~= 0) then
+            return { status = 'error', code = 'getprop_failed', message = 'getprop 执行失败', output = output or '', detail = tostring(code) .. ':' .. tostring(reason) .. ':' .. tostring(exitCode) }
+        end
+        if output == nil then
+            return { status = 'error', code = 'output_unreadable', message = '无法读取 getprop 输出文件' }
+        end
+        local value = output:gsub('^%s+', ''):gsub('%s+$', '')
+        return { status = 'ok', value = value, output = output, message = '属性已读取' }
     end
-    os.execute('setprop ' .. req.property .. ' ' .. req.value)
-    os.execute('getprop ' .. req.property .. ' > "' .. outFile .. '"')
-    local value = (readAll(outFile, 256) or ''):gsub('%s+$', '')
-    os.remove(outFile)
-    if value ~= req.value then
-        return { status = 'error', value = value, message = '属性写入验证失败' }
+    if req.action == 'get' then return readProperty() end
+    local ok, code, reason = pcall(os.execute, 'setprop ' .. req.property .. ' ' .. req.value)
+    if not ok or code == false or (code == nil and reason ~= nil) or (type(code) == 'number' and code ~= 0) then
+        return { status = 'error', code = 'setprop_failed', message = 'setprop 执行失败' }
     end
-    return { status = 'ok', value = value, message = '属性已保存' }
+    local result = readProperty()
+    if result.status ~= 'ok' then return result end
+    if result.value ~= req.value then
+        return { status = 'error', code = 'readback_mismatch', value = result.value, output = result.output, message = '属性写入验证失败' }
+    end
+    result.message = '属性已保存'
+    return result
 end
 
 local function writeScreenshotResult(data)
@@ -3691,6 +3829,8 @@ local function readFileRequest()
         offset = tonumber(json.offset) or 0,
         length = tonumber(json.length) or 128,
         limit = tonumber(json.limit) or 4096,
+        key = json.key or '',
+        value = json.value or '',
         timestamp = json.timestamp
     }
 end
@@ -3715,7 +3855,12 @@ function readPropertyRequest()
         json = jsonDecode(content)
         if not json then return nil end
     end
-    if not json.seq or (json.action ~= 'get' and json.action ~= 'set') then return nil end
+    if type(json) ~= 'table' or not json.seq then return nil end
+    if json.property == 'about_system_text' and (json.action == 'about_status' or json.action == 'about_set' or json.action == 'about_restore') then
+        if not validateIpcGuard(json, 'property_request.json') then return nil end
+        return { seq = json.seq, action = json.action, property = json.property, value = json.value }
+    end
+    if json.action ~= 'get' and json.action ~= 'set' then return nil end
     if not isSystemExtensionProperty(json.property) then
         rejectInjectedRequest('property_request.json', '属性不在系统扩展允许范围内')
         return nil
@@ -4098,6 +4243,130 @@ local function fileManagerInfo(path)
     return { status = 'ok', path = path, name = basename(path), size = fileManagerSize(path) }
 end
 
+-- ====== SQLite / UnQLite database bridge ======
+DB_MAX_BYTES = 262144
+DB_MAX_RECORDS = 200
+
+function dbReadBytes(path)
+    local f = io.open(path, 'rb')
+    if not f then return nil, 'open failed' end
+    local size = f:seek('end') or 0
+    f:seek('set', 0)
+    local data = f:read(math.min(size, DB_MAX_BYTES))
+    f:close()
+    if not data then return nil, 'read failed' end
+    return data, size
+end
+
+function dbU16(data, p)
+    local a, b = data:byte(p, p + 1)
+    if not a or not b then return nil end
+    return a * 256 + b
+end
+
+function dbU32(data, p)
+    local a, b, c, d = data:byte(p, p + 3)
+    if not a or not d then return nil end
+    return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+function dbU64(data, p)
+    local hi, lo = dbU32(data, p), dbU32(data, p + 4)
+    if not hi or hi ~= 0 then return nil end
+    return lo
+end
+
+function dbReadableKey(v)
+    if not v or #v < 1 or #v > 4096 then return false end
+    for i = 1, #v do local b = v:byte(i); if b == 0 or b < 32 or b == 127 then return false end end
+    return true
+end
+
+function dbReadableValue(v)
+    local out = {}
+    for i = 1, #v do local b = v:byte(i); out[#out + 1] = (b == 9 or b == 10 or b == 13 or b >= 32) and string.char(b) or '.' end
+    return table.concat(out)
+end
+
+function dbHash(key)
+    local h = 5381
+    for i = 1, math.min(#key, 2048) do h = (h * 33 + key:byte(i)) % 4294967296 end
+    return h
+end
+
+function dbPack16(v) return string.char(math.floor(v / 256) % 256, v % 256) end
+function dbPack32(v) return string.char(math.floor(v / 16777216) % 256, math.floor(v / 65536) % 256, math.floor(v / 256) % 256, v % 256) end
+function dbPack64(v) return string.char(0, 0, 0, 0) .. dbPack32(v) end
+
+function dbRecords(data)
+    if data:sub(1, 7):lower() ~= 'unqlite' then return nil end
+    local pageSize = dbU32(data, 20)
+    if not pageSize or pageSize < 512 or pageSize > 65536 or pageSize & (pageSize - 1) ~= 0 then return nil end
+    local records, seen, pageStart = {}, {}, 0
+    while pageStart + 12 <= #data and #records < DB_MAX_RECORDS do
+        local cell = dbU16(data, pageStart + 1) or 0
+        local pageEnd = math.min(pageStart + pageSize, #data)
+        local previous = 0; local visited = {}
+        while cell > 0 and not visited[cell] and cell < pageSize and #records < DB_MAX_RECORDS do
+            visited[cell] = true
+            local pos = pageStart + cell + 1
+            if cell < 12 or pos + 25 > pageEnd then break end
+            local hash, keySize, valueSize = dbU32(data, pos), dbU32(data, pos + 4), dbU64(data, pos + 8)
+            local nextCell, overflow = dbU16(data, pos + 16) or 0, dbU64(data, pos + 18)
+            if not hash or not keySize or not valueSize or overflow == nil or keySize < 1 or keySize > 4096 then break end
+            if overflow == 0 then
+                local payload = pos + 26
+                local finish = payload + keySize + valueSize - 1
+                if finish > pageEnd or finish > #data then break end
+                local key, raw = data:sub(payload, payload + keySize - 1), data:sub(payload + keySize, finish)
+                if dbReadableKey(key) and dbHash(key) == hash then
+                    local record = { key = key, value = dbReadableValue(raw), raw = raw, editable = dbReadableValue(raw) == raw, pageStart = pageStart, pageSize = pageSize, cell = cell, pos = pos - 1, valueOffset = payload + keySize - 1, keySize = keySize, valueSize = valueSize, nextCell = nextCell, previous = previous, overflow = overflow, hash = hash }
+                    if seen[key] then records[seen[key]] = record else records[#records + 1] = record; seen[key] = #records end
+                end
+            end
+            if nextCell == cell or nextCell >= pageSize then break end
+            previous, cell = cell, nextCell
+        end
+        pageStart = pageStart + pageSize
+    end
+    return records
+end
+
+function dbVisibleStrings(data)
+    local out, current = {}, {}
+    local function flush() if #current >= 2 then out[#out + 1] = table.concat(current) end; current = {} end
+    for i = 1, #data do local b = data:byte(i); if b >= 32 and b <= 126 then current[#current + 1] = string.char(b) else flush() end; if #out >= DB_MAX_RECORDS * 2 then break end end
+    flush(); local rows = {}; for i = 1, math.min(#out, DB_MAX_RECORDS * 2), 2 do rows[#rows + 1] = { key = out[i], value = out[i + 1] or '', editable = false } end; return rows
+end
+
+function dbFormat(data) if data:sub(1, 16) == 'SQLite format 3\0' then return 'SQLite' end; if data:sub(1, 7):lower() == 'unqlite' then return 'UnQLite' end; return 'Binary DB' end
+
+function dbList(path)
+    path = normalizeFileManagerPath(path)
+    local data, size, err = dbReadBytes(path); if not data then return { status = 'error', message = err, path = path } end
+    local format = dbFormat(data); local records = dbRecords(data) or dbVisibleStrings(data)
+    return { status = 'ok', action = 'db_list', path = path, format = format, size = size, editable = format == 'UnQLite', records = records, note = format == 'UnQLite' and '' or '仅显示可读内容' }
+end
+
+function dbWrite(path, key, newValue)
+    local data, _, err = dbReadBytes(path); if not data then return { status = 'error', message = err } end
+    local records = dbRecords(data); if not records then return { status = 'error', message = '仅支持 UnQLite 原地修改' } end
+    local target; for _, r in ipairs(records) do if r.key == key then target = r; break end end
+    if not target then return { status = 'error', message = '键不存在' } end
+    if target.overflow ~= 0 then return { status = 'error', message = '该值使用溢出页，当前仅支持页内值' } end
+    newValue = tostring(newValue or '')
+    local page = data:sub(target.pageStart + 1, target.pageStart + target.pageSize)
+    local oldSize, newSize = target.valueSize, #newValue
+    if newSize > oldSize then return { status = 'error', message = '新值超过原值空间，请先删除内容后再写入' } end
+    local valueInPage = target.valueOffset - target.pageStart
+    page = page:sub(1, valueInPage) .. newValue .. page:sub(valueInPage + oldSize + 1)
+    page = page:sub(1, target.cell + 7) .. dbPack64(newSize) .. page:sub(target.cell + 16)
+    local f = io.open(path, 'r+b'); if not f then return { status = 'error', message = '无法打开数据库写入' } end
+    f:seek('set', target.pageStart); local ok = f:write(page); f:close()
+    if not ok then return { status = 'error', message = '原地写入失败' } end
+    return { status = 'ok', action = 'db_write', path = path, key = key, value = newValue, message = '已直接写入原数据库' }
+end
+
 local function sanitizeFileText(text)
     text = tostring(text or '')
     local out = {}
@@ -4329,7 +4598,47 @@ local function fileManagerDelete(req)
     return { status = ok and 'ok' or 'error', message = ok and '删除完成' or '删除失败', path = path }
 end
 
+local lastImagePreviewPath = nil
+local function fileManagerImage(req)
+    local path = normalizeFileManagerPath(req.path)
+    local extension = string.lower(path:match('%.([%w]+)$') or '')
+    local formats = { png = true, jpg = true, jpeg = true, bmp = true }
+    if not formats[extension] then
+        return { status = 'error', message = '仅支持 PNG/JPEG/BMP 图片', path = path }
+    end
+    local size = fileManagerSizeBytes(path)
+    if size <= 0 or size > 3 * 1024 * 1024 then
+        return { status = 'error', message = '图片为空、不可读取或超过 3 MiB', path = path }
+    end
+    local relative = path:sub(1, #TARGET_DIR) == TARGET_DIR and path:sub(#TARGET_DIR + 1) or nil
+    if relative and relative:match('^[%w_/%.-]+$') and not relative:find('..', 1, true) then
+        return { status = 'ok', path = path, uri = 'internal://files/' .. relative }
+    end
+    local folder = TARGET_DIR .. 'file_preview/'
+    mkdir(folder)
+    local filename = 'image_' .. tostring(req.seq):gsub('[^%w_-]', '') .. '.' .. extension
+    if not copyFileChunked(path, folder .. filename, size) then
+        return { status = 'error', message = '图片预览缓存写入失败', path = path }
+    end
+    if lastImagePreviewPath and lastImagePreviewPath ~= folder .. filename then os.remove(lastImagePreviewPath) end
+    lastImagePreviewPath = folder .. filename
+    return { status = 'ok', path = path, uri = 'internal://files/file_preview/' .. filename }
+end
+
 local function executeFileRequest(req)
+    if req.action == 'db_list' then return dbList(req.path) end
+    if req.action == 'db_read' then
+        local listed = dbList(req.path)
+        if listed.status ~= 'ok' then return listed end
+        for _, record in ipairs(listed.records or {}) do
+            if record.key == req.key then
+                return { status = 'ok', action = 'db_read', path = req.path, format = listed.format, key = record.key, value = record.value, editable = listed.editable and record.editable == true }
+            end
+        end
+        return { status = 'error', message = '键不存在' }
+    end
+    if req.action == 'db_write' then return dbWrite(req.path, req.key, req.value) end
+    if req.action == 'image' then return fileManagerImage(req) end
     if req.action == 'list' then return fileManagerList(req.path) end
     if req.action == 'info' then return fileManagerInfo(req.path) end
     if req.action == 'text' then return fileManagerText(req.path, req.limit) end
