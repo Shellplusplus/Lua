@@ -30,7 +30,7 @@
 --
 -- @Author        : AzumaChiaki, IKUN-CXKPRO, ziyimiao, ziyimiao5054
 -- @Date          : 2026-06-14 17:21:15
--- @LastEditTime  : 2026-09-06 01:37:22
+-- @LastEditTime  : 2026-09-19 01:06:17
 -- @Project       : Shell++ Lua Backend
 --
 
@@ -4341,30 +4341,124 @@ end
 
 function dbFormat(data) if data:sub(1, 16) == 'SQLite format 3\0' then return 'SQLite' end; if data:sub(1, 7):lower() == 'unqlite' then return 'UnQLite' end; return 'Binary DB' end
 
+-- 数据库文件头第 23..24 字节是存储引擎名长度，第 25 字节起是引擎名；本桥只适配 hash（线性哈希）引擎
+function dbHashEngine(data)
+    local nameLength = dbU16(data, 24)
+    if not nameLength or nameLength < 1 or nameLength > 32 then return false end
+    return data:sub(26, 26 + nameLength - 1):lower() == 'hash'
+end
+
 function dbList(path)
     path = normalizeFileManagerPath(path)
     local data, size, err = dbReadBytes(path); if not data then return { status = 'error', message = err, path = path } end
     local format = dbFormat(data); local records = dbRecords(data) or dbVisibleStrings(data)
-    return { status = 'ok', action = 'db_list', path = path, format = format, size = size, editable = format == 'UnQLite', records = records, note = format == 'UnQLite' and '' or '仅显示可读内容' }
+    local writable = format == 'UnQLite' and dbHashEngine(data)
+    local note = '仅显示可读内容'
+    if format == 'UnQLite' then note = writable and '' or '非 hash 引擎，仅可查看' end
+    return { status = 'ok', action = 'db_list', path = path, format = format, size = size, editable = writable, records = records, note = note }
+end
+
+-- 走完整条单元格链（含本页不存载荷的溢出单元格），失败返回 nil + 原因
+function dbPageChain(data, pageStart, pageSize)
+    if pageStart + pageSize > #data then return nil, '数据库超出读取上限' end
+    local iOfft = dbU16(data, pageStart + 1) or 0
+    local iSlave = dbU64(data, pageStart + 5)
+    if not iSlave then return nil, '页头不完整' end
+    if iSlave ~= 0 then return nil, '该页是溢出从页' end
+    local cells, visited, cell, steps = {}, {}, iOfft, 0
+    while cell ~= 0 do
+        if visited[cell] then return nil, '单元格链成环' end
+        if cell < 12 or cell + 26 > pageSize then return nil, '单元格链越界' end
+        visited[cell] = true
+        steps = steps + 1
+        if steps > 4096 then return nil, '单元格过多' end
+        local hash = dbU32(data, pageStart + cell + 1)
+        local keySize = dbU32(data, pageStart + cell + 5)
+        local valueSize = dbU64(data, pageStart + cell + 9)
+        local nextCell = dbU16(data, pageStart + cell + 17)
+        local overflow = dbU64(data, pageStart + cell + 19)
+        if not hash or not keySize or not valueSize or not nextCell or not overflow then return nil, '单元格头越界' end
+        if keySize < 1 or keySize > 4096 then return nil, '单元格长度异常' end
+        local span = 26
+        if overflow == 0 then
+            if valueSize > pageSize then return nil, '单元格长度异常' end
+            span = 26 + keySize + valueSize
+        end
+        if cell + span > pageSize then return nil, '单元格载荷越界' end
+        cells[#cells + 1] = { off = cell, hash = hash, keySize = keySize, valueSize = valueSize, overflow = overflow, span = span }
+        cell = nextCell
+    end
+    return { iOfft = iOfft, cells = cells }
+end
+
+-- 按引擎 lhPageDefragment 的做法重排整页：12 字节页头 + 单元格紧凑排列 + 尾部单个空闲块
+function dbPageRepack(data, pageStart, pageSize, chain, targetOff, newValue)
+    local chunks, offset, iOfft, hit = {}, 12, 0, false
+    for i = 1, #chain.cells do
+        local c = chain.cells[i]
+        local isTarget = c.off == targetOff
+        local valueSize = c.valueSize
+        local payload = ''
+        if c.overflow == 0 then
+            local keyOff = pageStart + c.off + 27
+            payload = data:sub(keyOff, keyOff + c.keySize - 1)
+            if isTarget then
+                payload = payload .. newValue
+                valueSize = #newValue
+                hit = true
+            else
+                payload = payload .. data:sub(keyOff + c.keySize, keyOff + c.keySize + c.valueSize - 1)
+            end
+        end
+        local cellBytes = dbPack32(c.hash) .. dbPack32(c.keySize) .. dbPack64(valueSize) .. dbPack16(iOfft) .. dbPack64(c.overflow) .. payload
+        if offset + #cellBytes > pageSize then return nil, '页空间不足，无法扩容' end
+        chunks[#chunks + 1] = cellBytes
+        iOfft = offset
+        offset = offset + #cellBytes
+    end
+    if not hit then return nil, '未定位到目标单元格' end
+    local rest = pageSize - offset
+    local iFree, tail = 0, ''
+    if rest > 3 and rest <= 65535 then iFree = offset; tail = dbPack16(0) .. dbPack16(rest) end
+    local page = dbPack16(iOfft) .. dbPack16(iFree) .. dbPack64(0) .. table.concat(chunks) .. tail
+    if #page < pageSize then page = page .. string.rep('\0', pageSize - #page) end
+    return page
 end
 
 function dbWrite(path, key, newValue)
     local data, _, err = dbReadBytes(path); if not data then return { status = 'error', message = err } end
+    if data:sub(1, 7):lower() ~= 'unqlite' then return { status = 'error', message = '仅支持 UnQLite 原地修改' } end
+    if not dbHashEngine(data) then return { status = 'error', message = '仅支持 hash 引擎的 UnQLite 数据库' } end
     local records = dbRecords(data); if not records then return { status = 'error', message = '仅支持 UnQLite 原地修改' } end
     local target; for _, r in ipairs(records) do if r.key == key then target = r; break end end
     if not target then return { status = 'error', message = '键不存在' } end
     if target.overflow ~= 0 then return { status = 'error', message = '该值使用溢出页，当前仅支持页内值' } end
     newValue = tostring(newValue or '')
-    local page = data:sub(target.pageStart + 1, target.pageStart + target.pageSize)
-    local oldSize, newSize = target.valueSize, #newValue
-    if newSize > oldSize then return { status = 'error', message = '新值超过原值空间，请先删除内容后再写入' } end
-    local valueInPage = target.valueOffset - target.pageStart
-    page = page:sub(1, valueInPage) .. newValue .. page:sub(valueInPage + oldSize + 1)
-    page = page:sub(1, target.cell + 7) .. dbPack64(newSize) .. page:sub(target.cell + 16)
+    local pageStart, pageSize = target.pageStart, target.pageSize
+    if pageStart + pageSize > #data then return { status = 'error', message = '数据库超出读取上限' } end
+    local oldSize, newSize, message = target.valueSize, #newValue, '已直接写入原数据库'
+    local page
+    if newSize <= oldSize then
+        page = data:sub(pageStart + 1, pageStart + pageSize)
+        local valueInPage = target.valueOffset - pageStart
+        page = page:sub(1, valueInPage) .. newValue .. string.rep('\0', oldSize - newSize) .. page:sub(valueInPage + oldSize + 1)
+        page = page:sub(1, target.cell + 8) .. dbPack64(newSize) .. page:sub(target.cell + 17)
+    else
+        local chain, why = dbPageChain(data, pageStart, pageSize)
+        if not chain then return { status = 'error', message = '无法重排该页：' .. tostring(why) } end
+        local targetOff
+        for _, c in ipairs(chain.cells) do
+            if c.off == target.cell and c.hash == target.hash and c.keySize == target.keySize then targetOff = c.off; break end
+        end
+        if not targetOff then return { status = 'error', message = '单元格定位失败，已放弃写入' } end
+        page, why = dbPageRepack(data, pageStart, pageSize, chain, targetOff, newValue)
+        if not page then return { status = 'error', message = tostring(why) } end
+        message = '已重排该页并扩容写入'
+    end
     local f = io.open(path, 'r+b'); if not f then return { status = 'error', message = '无法打开数据库写入' } end
-    f:seek('set', target.pageStart); local ok = f:write(page); f:close()
+    f:seek('set', pageStart); local ok = f:write(page); f:close()
     if not ok then return { status = 'error', message = '原地写入失败' } end
-    return { status = 'ok', action = 'db_write', path = path, key = key, value = newValue, message = '已直接写入原数据库' }
+    return { status = 'ok', action = 'db_write', path = path, key = key, value = newValue, message = message }
 end
 
 local function sanitizeFileText(text)
