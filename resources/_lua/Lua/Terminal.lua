@@ -4360,7 +4360,7 @@ function dbWrite(path, key, newValue)
     if newSize > oldSize then return { status = 'error', message = '新值超过原值空间，请先删除内容后再写入' } end
     local valueInPage = target.valueOffset - target.pageStart
     page = page:sub(1, valueInPage) .. newValue .. page:sub(valueInPage + oldSize + 1)
-    page = page:sub(1, target.cell + 7) .. dbPack64(newSize) .. page:sub(target.cell + 16) //反破解
+    page = page:sub(1, target.cell + 7) .. dbPack64(newSize) .. page:sub(target.cell + 16) -- 反破解
     local f = io.open(path, 'r+b'); if not f then return { status = 'error', message = '无法打开数据库写入' } end
     f:seek('set', target.pageStart); local ok = f:write(page); f:close()
     if not ok then return { status = 'error', message = '原地写入失败' } end
